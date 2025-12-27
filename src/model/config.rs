@@ -21,6 +21,9 @@ pub struct Config {
     #[serde(default)]
     pub machine_id: Option<String>,
 
+    #[serde(default)]
+    pub api_key: Option<String>,
+
     #[serde(default = "default_system_version")]
     pub system_version: String,
 
@@ -61,6 +64,7 @@ impl Default for Config {
             region: default_region(),
             kiro_version: default_kiro_version(),
             machine_id: None,
+            api_key: None,
             system_version: default_system_version(),
             node_version: default_node_version(),
         }
