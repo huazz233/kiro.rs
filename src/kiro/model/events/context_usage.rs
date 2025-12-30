@@ -31,60 +31,10 @@ impl ContextUsageEvent {
     pub fn formatted_percentage(&self) -> String {
         format!("{:.2}%", self.context_usage_percentage)
     }
-
-    /// 判断上下文使用是否超过阈值
-    ///
-    /// # Arguments
-    /// * `threshold` - 阈值百分比 (0-100)
-    pub fn exceeds_threshold(&self, threshold: f64) -> bool {
-        self.context_usage_percentage > threshold
-    }
-
-    /// 判断上下文是否接近满 (超过 80%)
-    pub fn is_near_full(&self) -> bool {
-        self.exceeds_threshold(80.0)
-    }
-
-    /// 判断上下文是否已满 (超过 95%)
-    pub fn is_full(&self) -> bool {
-        self.exceeds_threshold(95.0)
-    }
 }
 
 impl std::fmt::Display for ContextUsageEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.formatted_percentage())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_formatted_percentage() {
-        let event = ContextUsageEvent {
-            context_usage_percentage: 50.123,
-        };
-        assert_eq!(event.formatted_percentage(), "50.12%");
-    }
-
-    #[test]
-    fn test_threshold() {
-        let event = ContextUsageEvent {
-            context_usage_percentage: 85.0,
-        };
-        assert!(event.exceeds_threshold(80.0));
-        assert!(!event.exceeds_threshold(90.0));
-        assert!(event.is_near_full());
-        assert!(!event.is_full());
-    }
-
-    #[test]
-    fn test_full() {
-        let event = ContextUsageEvent {
-            context_usage_percentage: 98.0,
-        };
-        assert!(event.is_full());
     }
 }
