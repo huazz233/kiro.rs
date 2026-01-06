@@ -8,7 +8,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::tool::{InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry};
+use crate::kiro::model::requests::tool::{
+    InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
+};
 
 use super::types::{ContentBlock, MessagesRequest, Thinking};
 
@@ -36,14 +38,14 @@ pub fn map_model(model: &str) -> Option<String> {
 #[derive(Debug)]
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
-    pub conversation_state: ConversationState
+    pub conversation_state: ConversationState,
 }
 
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
     UnsupportedModel(String),
-    EmptyMessages
+    EmptyMessages,
 }
 
 impl std::fmt::Display for ConversionError {
@@ -116,9 +118,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_current_message(current_message)
         .with_history(history);
 
-    Ok(ConversionResult {
-        conversation_state
-    })
+    Ok(ConversionResult { conversation_state })
 }
 
 /// 确定聊天触发类型
@@ -137,7 +137,7 @@ fn determine_chat_trigger_type(req: &MessagesRequest) -> String {
 
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
-    content: &serde_json::Value
+    content: &serde_json::Value,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -173,7 +173,8 @@ fn process_message_content(
                                 } else {
                                     ToolResult::success(&tool_use_id, result_content)
                                 };
-                                result.status = Some(if is_error { "error" } else { "success" }.to_string());
+                                result.status =
+                                    Some(if is_error { "error" } else { "success" }.to_string());
 
                                 tool_results.push(result);
                             }
@@ -273,10 +274,7 @@ fn has_thinking_tags(content: &str) -> bool {
 }
 
 /// 构建历史消息
-fn build_history(
-    req: &MessagesRequest,
-    model_id: &str,
-) -> Result<Vec<Message>, ConversionError> {
+fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -458,7 +456,10 @@ fn convert_assistant_message(
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
     let final_content = if !thinking_content.is_empty() {
         if !text_content.is_empty() {
-            format!("<thinking>{}</thinking>\n\n{}", thinking_content, text_content)
+            format!(
+                "<thinking>{}</thinking>\n\n{}",
+                thinking_content, text_content
+            )
         } else {
             format!("<thinking>{}</thinking>", thinking_content)
         }
@@ -482,18 +483,34 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(map_model("claude-sonnet-4-20250514").unwrap().contains("sonnet"));
-        assert!(map_model("claude-3-5-sonnet-20241022").unwrap().contains("sonnet"));
+        assert!(
+            map_model("claude-sonnet-4-20250514")
+                .unwrap()
+                .contains("sonnet")
+        );
+        assert!(
+            map_model("claude-3-5-sonnet-20241022")
+                .unwrap()
+                .contains("sonnet")
+        );
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(map_model("claude-opus-4-20250514").unwrap().contains("opus"));
+        assert!(
+            map_model("claude-opus-4-20250514")
+                .unwrap()
+                .contains("opus")
+        );
     }
 
     #[test]
     fn test_map_model_haiku() {
-        assert!(map_model("claude-haiku-4-20250514").unwrap().contains("haiku"));
+        assert!(
+            map_model("claude-haiku-4-20250514")
+                .unwrap()
+                .contains("haiku")
+        );
     }
 
     #[test]

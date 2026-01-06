@@ -6,7 +6,10 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
-use super::types::{AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem, CredentialsStatusResponse};
+use super::types::{
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
+    CredentialsStatusResponse,
+};
 
 /// Admin 服务
 ///
@@ -142,11 +145,7 @@ impl AdminService {
     }
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
-    fn classify_error(
-        &self,
-        e: anyhow::Error,
-        id: u64,
-    ) -> AdminServiceError {
+    fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
@@ -156,11 +155,7 @@ impl AdminService {
     }
 
     /// 分类余额查询错误（可能涉及上游 API 调用）
-    fn classify_balance_error(
-        &self,
-        e: anyhow::Error,
-        id: u64,
-    ) -> AdminServiceError {
+    fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
 
         // 1. 凭据不存在

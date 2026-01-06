@@ -4,12 +4,12 @@
 //! 支持流式和非流式请求
 //! 支持多凭据故障转移和重试
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST};
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
@@ -245,8 +245,12 @@ impl KiroProvider {
                 );
             }
 
-            last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}",
-                if is_stream { "流式" } else { "非流式" }, status, body));
+            last_error = Some(anyhow::anyhow!(
+                "{} API 请求失败: {} {}",
+                if is_stream { "流式" } else { "非流式" },
+                status,
+                body
+            ));
         }
 
         // 所有重试都失败
@@ -309,17 +313,16 @@ mod tests {
         let headers = provider.build_headers(&ctx).unwrap();
 
         assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
-        assert_eq!(
-            headers.get("x-amzn-codewhisperer-optout").unwrap(),
-            "true"
-        );
+        assert_eq!(headers.get("x-amzn-codewhisperer-optout").unwrap(), "true");
         assert_eq!(headers.get("x-amzn-kiro-agent-mode").unwrap(), "vibe");
-        assert!(headers
-            .get(AUTHORIZATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("Bearer "));
+        assert!(
+            headers
+                .get(AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("Bearer ")
+        );
         assert_eq!(headers.get(CONNECTION).unwrap(), "close");
     }
 }
