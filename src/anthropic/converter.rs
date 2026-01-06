@@ -59,6 +59,45 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
+
+/// 收集历史消息中使用的所有工具名称
+fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
+    let mut tool_names = Vec::new();
+
+    for msg in history {
+        if let Message::Assistant(assistant_msg) = msg {
+            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+                for tool_use in tool_uses {
+                    if !tool_names.contains(&tool_use.name) {
+                        tool_names.push(tool_use.name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    tool_names
+}
+
+/// 为历史中使用但不在 tools 列表中的工具创建占位符定义
+/// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
+fn create_placeholder_tool(name: &str) -> Tool {
+    Tool {
+        tool_specification: ToolSpecification {
+            name: name.to_string(),
+            description: "Tool used in conversation history".to_string(),
+            input_schema: InputSchema::from_json(serde_json::json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": true
+            })),
+        },
+    }
+}
+
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
@@ -82,9 +121,27 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
-    let tools = convert_tools(&req.tools);
+    let mut tools = convert_tools(&req.tools);
 
-    // 7. 构建 UserInputMessageContext
+    // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
+    let history = build_history(req, &model_id)?;
+
+    // 8. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
+    // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
+    // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
+    let history_tool_names = collect_history_tool_names(&history);
+    let existing_tool_names: std::collections::HashSet<_> = tools
+        .iter()
+        .map(|t| t.tool_specification.name.to_lowercase())
+        .collect();
+
+    for tool_name in history_tool_names {
+        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+            tools.push(create_placeholder_tool(&tool_name));
+        }
+    }
+
+    // 9. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
     if !tools.is_empty() {
         context = context.with_tools(tools);
@@ -93,7 +150,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         context = context.with_tool_results(tool_results.clone());
     }
 
-    // 8. 构建当前消息
+    // 10. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let content = text_content;
 
@@ -107,10 +164,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     let current_message = CurrentMessage::new(user_input);
 
-    // 9. 构建历史消息
-    let history = build_history(req, &model_id)?;
-
-    // 10. 构建 ConversationState
+    // 11. 构建 ConversationState
     let conversation_state = ConversationState::new(conversation_id)
         .with_agent_continuation_id(agent_continuation_id)
         .with_agent_task_type("vibe")
@@ -540,5 +594,97 @@ mod tests {
         assert!(is_unsupported_tool("websearch"));
         assert!(is_unsupported_tool("WebSearch"));
         assert!(!is_unsupported_tool("read_file"));
+    }
+
+    #[test]
+    fn test_collect_history_tool_names() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 创建包含工具使用的历史消息
+        let mut assistant_msg = AssistantMessage::new("I'll read the file.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+            ToolUseEntry::new("tool-2", "write")
+                .with_input(serde_json::json!({"path": "/out.txt"})),
+        ]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new(
+                "Read the file",
+                "claude-sonnet-4.5",
+            )),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        let tool_names = collect_history_tool_names(&history);
+        assert_eq!(tool_names.len(), 2);
+        assert!(tool_names.contains(&"read".to_string()));
+        assert!(tool_names.contains(&"write".to_string()));
+    }
+
+    #[test]
+    fn test_create_placeholder_tool() {
+        let tool = create_placeholder_tool("my_custom_tool");
+
+        assert_eq!(tool.tool_specification.name, "my_custom_tool");
+        assert!(!tool.tool_specification.description.is_empty());
+
+        // 验证 JSON 序列化正确
+        let json = serde_json::to_string(&tool).unwrap();
+        assert!(json.contains("\"name\":\"my_custom_tool\""));
+    }
+
+    #[test]
+    fn test_history_tools_added_to_tools_list() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 创建一个请求，历史中有工具使用，但 tools 列表为空
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "I'll read the file."},
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/test.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None, // 没有提供工具定义
+            tool_choice: None,
+            thinking: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+
+        // 验证 tools 列表中包含了历史中使用的工具的占位符定义
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert!(!tools.is_empty(), "tools 列表不应为空");
+        assert!(
+            tools.iter().any(|t| t.tool_specification.name == "read"),
+            "tools 列表应包含 'read' 工具的占位符定义"
+        );
     }
 }
