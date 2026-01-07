@@ -59,6 +59,66 @@ impl std::fmt::Display for ConversionError {
 
 impl std::error::Error for ConversionError {}
 
+/// Claude Code Agent 标识字符串
+const CLAUDE_CODE_AGENT_MARKER: &str = "You are an agent for Claude Code, Anthropic's official CLI for Claude.";
+
+/// 检查请求是否来自 Claude Code Agent
+///
+/// 在 system 消息中搜索 agent 标识字符串
+fn is_claude_code_agent(req: &MessagesRequest) -> bool {
+    // 检查 system 消息
+    if let Some(ref system) = req.system {
+        for sys_msg in system {
+            if sys_msg.text.contains(CLAUDE_CODE_AGENT_MARKER) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// 使用 conversation_id 作为种子生成确定性 UUID
+///
+/// 同一个 conversation_id 总是生成相同的 UUID，确保同一会话中的 agentContinuationId 保持一致
+fn generate_deterministic_uuid(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // 使用 SHA-256 哈希种子
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    let hash = hasher.finalize();
+
+    // 取前 16 字节构造 UUID
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+
+    // 设置 UUID 版本为 4 (随机) 和变体
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // 版本 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // 变体 1
+
+    // 格式化为 UUID 字符串
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 /// 从 metadata.user_id 中提取 session UUID
 ///
 /// user_id 格式: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
@@ -136,7 +196,14 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let agent_continuation_id = Uuid::new_v4().to_string();
+
+    // 如果是 Claude Code Agent，使用 conversation_id 作为种子生成确定性的 agentContinuationId
+    // 确保同一会话中的 agentContinuationId 保持一致
+    let agent_continuation_id = if is_claude_code_agent(req) {
+        generate_deterministic_uuid(&conversation_id)
+    } else {
+        Uuid::new_v4().to_string()
+    };
 
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
@@ -804,6 +871,200 @@ mod tests {
                 .filter(|c| *c == '-')
                 .count(),
             4
+        );
+    }
+
+    #[test]
+    fn test_is_claude_code_agent_in_system() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        // 测试 system 消息中包含 agent 标识
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are an agent for Claude Code, Anthropic's official CLI for Claude."
+                    .to_string(),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+        };
+
+        assert!(is_claude_code_agent(&req));
+    }
+
+    #[test]
+    fn test_is_claude_code_agent_in_messages() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试 messages 中包含 agent 标识
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!(
+                    "You are an agent for Claude Code, the best coding assistant."
+                ),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+        };
+
+        assert!(is_claude_code_agent(&req));
+    }
+
+    #[test]
+    fn test_is_claude_code_agent_in_content_block() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试 content block 数组中包含 agent 标识
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "You are an agent for Claude Code, Anthropic's official CLI for Claude."}
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+        };
+
+        assert!(is_claude_code_agent(&req));
+    }
+
+    #[test]
+    fn test_is_not_claude_code_agent() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试普通请求不是 agent
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello, how are you?"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+        };
+
+        assert!(!is_claude_code_agent(&req));
+    }
+
+    #[test]
+    fn test_generate_deterministic_uuid() {
+        // 测试相同种子生成相同的 UUID
+        let seed = "a0662283-7fd3-4399-a7eb-52b9a717ae88";
+        let uuid1 = generate_deterministic_uuid(seed);
+        let uuid2 = generate_deterministic_uuid(seed);
+
+        assert_eq!(uuid1, uuid2);
+        assert_eq!(uuid1.len(), 36);
+        assert_eq!(uuid1.chars().filter(|c| *c == '-').count(), 4);
+    }
+
+    #[test]
+    fn test_generate_deterministic_uuid_different_seeds() {
+        // 测试不同种子生成不同的 UUID
+        let uuid1 = generate_deterministic_uuid("seed1");
+        let uuid2 = generate_deterministic_uuid("seed2");
+
+        assert_ne!(uuid1, uuid2);
+    }
+
+    #[test]
+    fn test_agent_continuation_id_deterministic_for_agent() {
+        use super::super::types::{Message as AnthropicMessage, Metadata, SystemMessage};
+
+        // 测试 agent 请求的 agentContinuationId 是确定性的
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are an agent for Claude Code, Anthropic's official CLI for Claude."
+                    .to_string(),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: Some(Metadata {
+                user_id: Some(
+                    "user_xxx_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
+                ),
+            }),
+        };
+
+        let result1 = convert_request(&req).unwrap();
+        let result2 = convert_request(&req).unwrap();
+
+        // 同一个 conversation_id 应该生成相同的 agentContinuationId
+        assert_eq!(
+            result1.conversation_state.agent_continuation_id,
+            result2.conversation_state.agent_continuation_id
+        );
+
+        // 验证 agentContinuationId 是基于 conversation_id 生成的
+        let expected_agent_id = generate_deterministic_uuid("a0662283-7fd3-4399-a7eb-52b9a717ae88");
+        assert_eq!(
+            result1.conversation_state.agent_continuation_id,
+            Some(expected_agent_id)
+        );
+    }
+
+    #[test]
+    fn test_agent_continuation_id_random_for_non_agent() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 测试非 agent 请求的 agentContinuationId 是随机的
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+        };
+
+        let result1 = convert_request(&req).unwrap();
+        let result2 = convert_request(&req).unwrap();
+
+        // 非 agent 请求每次生成不同的 agentContinuationId
+        assert_ne!(
+            result1.conversation_state.agent_continuation_id,
+            result2.conversation_state.agent_continuation_id
         );
     }
 }
