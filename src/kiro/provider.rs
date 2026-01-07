@@ -224,6 +224,25 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
+            // 429 Too Many Requests - 限流错误，不算凭据错误，重试但不禁用凭据
+            if status.as_u16() == 429 {
+                let body = response.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "API 请求被限流（尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求被限流: {} {}",
+                    if is_stream { "流式" } else { "非流式" },
+                    status,
+                    body
+                ));
+                continue;
+            }
+
             // 其他错误 - 记录失败并可能重试（使用绑定的 id）
             let body = response.text().await.unwrap_or_default();
             tracing::warn!(
