@@ -7,6 +7,7 @@ use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::Mutex as TokioMutex;
 
 use std::path::PathBuf;
@@ -363,6 +364,20 @@ pub(crate) async fn get_usage_limits(
 // 多凭据 Token 管理器
 // ============================================================================
 
+/// 凭据禁用原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisableReason {
+    /// 连续失败次数过多
+    FailureLimit,
+    /// 余额不足
+    InsufficientBalance,
+    /// 模型临时不可用（全局禁用）
+    ModelUnavailable,
+    /// 手动禁用
+    Manual,
+}
+
 /// 单个凭据条目的状态
 struct CredentialEntry {
     /// 凭据唯一 ID
@@ -373,6 +388,8 @@ struct CredentialEntry {
     failure_count: u32,
     /// 是否已禁用
     disabled: bool,
+    /// 禁用原因
+    disable_reason: Option<DisableReason>,
 }
 
 // ============================================================================
@@ -389,6 +406,8 @@ pub struct CredentialEntrySnapshot {
     pub priority: u32,
     /// 是否被禁用
     pub disabled: bool,
+    /// 禁用原因
+    pub disable_reason: Option<DisableReason>,
     /// 连续失败次数
     pub failure_count: u32,
     /// 认证方式
@@ -430,10 +449,20 @@ pub struct MultiTokenManager {
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
+    /// MODEL_TEMPORARILY_UNAVAILABLE 错误计数
+    model_unavailable_count: AtomicU32,
+    /// 全局禁用恢复时间（None 表示未被全局禁用）
+    global_recovery_time: Mutex<Option<DateTime<Utc>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+
+/// MODEL_TEMPORARILY_UNAVAILABLE 触发全局禁用的阈值
+const MODEL_UNAVAILABLE_THRESHOLD: u32 = 2;
+
+/// 全局禁用恢复时间（分钟）
+const GLOBAL_DISABLE_RECOVERY_MINUTES: i64 = 10;
 
 /// API 调用上下文
 ///
@@ -485,6 +514,7 @@ impl MultiTokenManager {
                     credentials: cred,
                     failure_count: 0,
                     disabled: false,
+                    disable_reason: None,
                 }
             })
             .collect();
@@ -516,6 +546,8 @@ impl MultiTokenManager {
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
+            model_unavailable_count: AtomicU32::new(0),
+            global_recovery_time: Mutex::new(None),
         };
 
         // 如果有新分配的 ID，立即持久化到配置文件
@@ -564,6 +596,9 @@ impl MultiTokenManager {
     /// 如果 Token 过期或即将过期，会自动刷新
     /// Token 刷新失败时会尝试下一个可用凭据（不计入失败次数）
     pub async fn acquire_context(&self) -> anyhow::Result<CallContext> {
+        // 检查是否需要自动恢复
+        self.check_and_recover();
+
         let total = self.total_count();
         let mut tried_count = 0;
 
@@ -794,6 +829,9 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
+        // 重置 MODEL_TEMPORARILY_UNAVAILABLE 计数器
+        self.model_unavailable_count.store(0, Ordering::SeqCst);
+
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             entry.failure_count = 0;
@@ -829,6 +867,7 @@ impl MultiTokenManager {
 
         if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
             entry.disabled = true;
+            entry.disable_reason = Some(DisableReason::FailureLimit);
             tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
             // 切换到优先级最高的可用凭据
@@ -879,6 +918,109 @@ impl MultiTokenManager {
         }
     }
 
+    /// 报告 MODEL_TEMPORARILY_UNAVAILABLE 错误
+    ///
+    /// 累计达到阈值后禁用所有凭据，10分钟后自动恢复
+    /// 返回是否触发了全局禁用
+    pub fn report_model_unavailable(&self) -> bool {
+        let count = self.model_unavailable_count.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::warn!(
+            "MODEL_TEMPORARILY_UNAVAILABLE 错误（{}/{}）",
+            count,
+            MODEL_UNAVAILABLE_THRESHOLD
+        );
+
+        if count >= MODEL_UNAVAILABLE_THRESHOLD {
+            self.disable_all_credentials(DisableReason::ModelUnavailable);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 禁用所有凭据
+    fn disable_all_credentials(&self, reason: DisableReason) {
+        let mut entries = self.entries.lock();
+        let mut recovery_time = self.global_recovery_time.lock();
+
+        for entry in entries.iter_mut() {
+            if !entry.disabled {
+                entry.disabled = true;
+                entry.disable_reason = Some(reason);
+            }
+        }
+
+        // 设置恢复时间
+        let recover_at = Utc::now() + Duration::minutes(GLOBAL_DISABLE_RECOVERY_MINUTES);
+        *recovery_time = Some(recover_at);
+
+        tracing::error!(
+            "所有凭据已被禁用（原因: {:?}），将于 {} 自动恢复",
+            reason,
+            recover_at.format("%H:%M:%S")
+        );
+    }
+
+    /// 检查并执行自动恢复
+    ///
+    /// 如果已到恢复时间，恢复因 ModelUnavailable 禁用的凭据
+    /// 余额不足的凭据不会被恢复
+    ///
+    /// 返回是否执行了恢复
+    pub fn check_and_recover(&self) -> bool {
+        let should_recover = {
+            let recovery_time = self.global_recovery_time.lock();
+            recovery_time.map(|t| Utc::now() >= t).unwrap_or(false)
+        };
+
+        if !should_recover {
+            return false;
+        }
+
+        let mut entries = self.entries.lock();
+        let mut recovery_time = self.global_recovery_time.lock();
+        let mut recovered_count = 0;
+
+        for entry in entries.iter_mut() {
+            // 只恢复因 ModelUnavailable 禁用的凭据，余额不足的不恢复
+            if entry.disabled && entry.disable_reason == Some(DisableReason::ModelUnavailable) {
+                entry.disabled = false;
+                entry.disable_reason = None;
+                entry.failure_count = 0;
+                recovered_count += 1;
+            }
+        }
+
+        // 重置全局状态
+        *recovery_time = None;
+        self.model_unavailable_count.store(0, Ordering::SeqCst);
+
+        if recovered_count > 0 {
+            tracing::info!("已自动恢复 {} 个凭据", recovered_count);
+            // 重新选择优先级最高的凭据
+            drop(recovery_time);
+            drop(entries);
+            self.select_highest_priority();
+        }
+
+        recovered_count > 0
+    }
+
+    /// 标记凭据为余额不足（不会被自动恢复）
+    pub fn mark_insufficient_balance(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.disabled = true;
+            entry.disable_reason = Some(DisableReason::InsufficientBalance);
+            tracing::warn!("凭据 #{} 已标记为余额不足", id);
+        }
+    }
+
+    /// 获取全局恢复时间（用于 Admin API）
+    pub fn get_recovery_time(&self) -> Option<DateTime<Utc>> {
+        *self.global_recovery_time.lock()
+    }
+
     /// 获取使用额度信息
     pub async fn get_usage_limits(&self) -> anyhow::Result<UsageLimitsResponse> {
         let ctx = self.acquire_context().await?;
@@ -908,6 +1050,7 @@ impl MultiTokenManager {
                     id: e.id,
                     priority: e.credentials.priority,
                     disabled: e.disabled,
+                    disable_reason: e.disable_reason,
                     failure_count: e.failure_count,
                     auth_method: e.credentials.auth_method.clone(),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
@@ -1079,6 +1222,7 @@ impl MultiTokenManager {
                 credentials: validated_cred,
                 failure_count: 0,
                 disabled: false,
+                disable_reason: None,
             });
         }
 

@@ -245,6 +245,33 @@ impl KiroProvider {
 
             // 其他错误 - 记录失败并可能重试（使用绑定的 id）
             let body = response.text().await.unwrap_or_default();
+
+            // 检查是否为 MODEL_TEMPORARILY_UNAVAILABLE 错误
+            if status.as_u16() == 500 && body.contains("MODEL_TEMPORARILY_UNAVAILABLE") {
+                tracing::warn!(
+                    "检测到 MODEL_TEMPORARILY_UNAVAILABLE 错误（尝试 {}/{}）",
+                    attempt + 1,
+                    max_retries
+                );
+                if self.token_manager.report_model_unavailable() {
+                    // 触发了全局禁用，直接返回错误
+                    let api_type = if is_stream { "流式" } else { "非流式" };
+                    anyhow::bail!(
+                        "{} API 请求失败（模型临时不可用，所有凭据已禁用 10 分钟）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（模型临时不可用）: {} {}",
+                    if is_stream { "流式" } else { "非流式" },
+                    status,
+                    body
+                ));
+                continue;
+            }
+
             tracing::warn!(
                 "API 请求失败（尝试 {}/{}）: {} {}",
                 attempt + 1,
