@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+- 新增 Bonus 用量包支持（`src/kiro/model/usage_limits.rs`）
+  - 新增 `Bonus` 结构体，支持 GIFT 类型的额外用量包
+  - 新增 `Bonus::is_active()` 方法，按状态/过期时间判断是否激活
+  - `usage_limit()` 和 `current_usage()` 现在会合并基础额度、免费试用额度和所有激活的 bonuses
+- 新增 Kiro Web Portal API 模块（`src/kiro/web_portal.rs`）
+  - 支持 CBOR 协议与 app.kiro.dev 通信
+  - 实现 `get_user_info()` 和 `get_user_usage_and_limits()` API
+  - 新增 `aggregate_account_info()` 聚合账号信息（套餐/用量/邮箱等）
+- Admin UI 前端增强
+  - 新增数字格式化工具（`admin-ui/src/lib/format.ts`）：K/M/B 显示、Token 对格式化、过期时间格式化
+  - 新增统计相关 API 和 Hooks：`getCredentialStats`, `resetCredentialStats`, `resetAllStats`
+  - 新增账号信息 API：`getCredentialAccountInfo`, `useCredentialAccountInfo`
+  - 扩展 `CredentialStatusItem` 添加统计字段（调用次数、Token 用量、最后调用时间等）
+  - 新增完整的账号信息类型定义（`AccountAggregateInfo`, `CreditsUsageSummary` 等）
+- 新增 `serde_cbor` 依赖用于 CBOR 编解码
+
 ### Changed
 - 调整重试策略：单凭据最大重试次数 3→2，单请求最大重试次数 9→5
   - `MAX_RETRIES_PER_CREDENTIAL`: 3 → 2
