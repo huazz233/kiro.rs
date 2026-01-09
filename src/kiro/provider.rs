@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 
 /// 每个凭据的最大重试次数
@@ -62,6 +61,27 @@ impl KiroProvider {
     /// 获取 API 基础域名
     pub fn base_domain(&self) -> String {
         format!("q.{}.amazonaws.com", self.token_manager.config().region)
+    }
+
+    /// 后台异步刷新余额缓存（如果需要）
+    fn spawn_balance_refresh(&self, id: u64) {
+        // 检查缓存是否需要刷新
+        if !self.token_manager.should_refresh_balance(id) {
+            return;
+        }
+        let tm = Arc::clone(&self.token_manager);
+        tokio::spawn(async move {
+            match tm.get_usage_limits_for(id).await {
+                Ok(resp) => {
+                    let remaining = resp.usage_limit() - resp.current_usage();
+                    tm.update_balance_cache(id, remaining);
+                    tracing::debug!("凭据 #{} 余额缓存已刷新: {:.2}", id, remaining);
+                }
+                Err(e) => {
+                    tracing::warn!("凭据 #{} 余额刷新失败: {}", id, e);
+                }
+            }
+        });
     }
 
     /// 构建请求头
@@ -130,8 +150,12 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        user_id: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, false, user_id).await
     }
 
     /// 发送流式 API 请求
@@ -145,8 +169,12 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        user_id: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_api_with_retry(request_body, true, user_id).await
     }
 
     /// 内部方法：带重试逻辑的 API 调用
@@ -159,14 +187,15 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        user_id: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..max_retries {
-            // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context().await {
+            // 获取调用上下文（绑定 index、credentials、token），支持用户亲和性
+            let ctx = match self.token_manager.acquire_context_for_user(user_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -214,6 +243,8 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                // 后台异步刷新余额缓存
+                self.spawn_balance_refresh(ctx.id);
                 return Ok(response);
             }
 
@@ -314,6 +345,7 @@ impl KiroProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::token_manager::CallContext;
     use crate::model::config::Config;
 

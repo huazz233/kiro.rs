@@ -158,6 +158,9 @@ pub async fn post_messages(
         .map(|t| t.thinking_type == "enabled")
         .unwrap_or(false);
 
+    // 提取 user_id 用于凭据亲和性
+    let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
+
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -166,11 +169,19 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            user_id,
         )
         .await
     } else {
         // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            user_id,
+        )
+        .await
     }
 }
 
@@ -181,9 +192,10 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    user_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let response = match provider.call_api_stream(request_body, user_id).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Kiro API 调用失败: {}", e);
@@ -326,9 +338,10 @@ async fn handle_non_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    user_id: Option<&str>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let response = match provider.call_api(request_body, user_id).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Kiro API 调用失败: {}", e);

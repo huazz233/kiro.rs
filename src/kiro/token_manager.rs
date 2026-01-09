@@ -12,7 +12,10 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::path::PathBuf;
 
+use std::collections::HashMap;
+
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::affinity::UserAffinityManager;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -432,6 +435,29 @@ pub struct ManagerSnapshot {
     pub available: usize,
 }
 
+/// 余额缓存条目
+struct CachedBalance {
+    remaining: f64,
+    cached_at: std::time::Instant,
+    /// 最近一段时间的使用次数（用于判断高频/低频）
+    recent_usage: u32,
+    /// 上次重置使用计数的时间
+    usage_reset_at: std::time::Instant,
+}
+
+/// 高频渠道 TTL（10 分钟）
+const BALANCE_TTL_HIGH_FREQ_SECS: u64 = 600;
+/// 低频渠道 TTL（30 分钟）
+const BALANCE_TTL_LOW_FREQ_SECS: u64 = 1800;
+/// 低余额渠道 TTL（24 小时）
+const BALANCE_TTL_LOW_BALANCE_SECS: u64 = 86400;
+/// 高频判定阈值（10分钟内使用超过此次数视为高频）
+const HIGH_FREQ_THRESHOLD: u32 = 20;
+/// 使用计数重置周期（10 分钟）
+const USAGE_COUNT_RESET_SECS: u64 = 600;
+/// 低余额阈值
+const LOW_BALANCE_THRESHOLD: f64 = 1.0;
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -453,6 +479,10 @@ pub struct MultiTokenManager {
     model_unavailable_count: AtomicU32,
     /// 全局禁用恢复时间（None 表示未被全局禁用）
     global_recovery_time: Mutex<Option<DateTime<Utc>>>,
+    /// 用户亲和性管理器
+    affinity: UserAffinityManager,
+    /// 余额缓存（用于故障转移时选择余额最高的凭据）
+    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -538,6 +568,23 @@ impl MultiTokenManager {
             .map(|e| e.id)
             .unwrap_or(0);
 
+        // 初始化余额缓存（为每个凭据创建初始条目，支持负载均衡）
+        let now = std::time::Instant::now();
+        let initial_cache: HashMap<u64, CachedBalance> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.id,
+                    CachedBalance {
+                        remaining: 0.0,
+                        cached_at: now,
+                        recent_usage: 0,
+                        usage_reset_at: now,
+                    },
+                )
+            })
+            .collect();
+
         let manager = Self {
             config,
             proxy,
@@ -548,6 +595,8 @@ impl MultiTokenManager {
             is_multiple_format,
             model_unavailable_count: AtomicU32::new(0),
             global_recovery_time: Mutex::new(None),
+            affinity: UserAffinityManager::new(),
+            balance_cache: Mutex::new(initial_cache),
         };
 
         // 如果有新分配的 ID，立即持久化到配置文件
@@ -656,6 +705,165 @@ impl MultiTokenManager {
                     tried_count += 1;
                 }
             }
+        }
+    }
+
+    /// 获取指定用户的 API 调用上下文（带亲和性）
+    ///
+    /// 如果用户已绑定凭据且该凭据可用，优先使用绑定的凭据
+    /// 否则使用默认的 acquire_context() 逻辑并建立新绑定
+    pub async fn acquire_context_for_user(
+        &self,
+        user_id: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
+        // 无 user_id 时走默认逻辑
+        let user_id = match user_id {
+            Some(id) if !id.is_empty() => id,
+            _ => return self.acquire_context().await,
+        };
+
+        // 检查亲和性绑定
+        if let Some(bound_id) = self.affinity.get(user_id) {
+            // 检查绑定的凭据是否可用
+            let is_available = {
+                let entries = self.entries.lock();
+                entries.iter().any(|e| e.id == bound_id && !e.disabled)
+            };
+
+            if is_available {
+                // 尝试使用绑定的凭据
+                let credentials = {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|e| e.id == bound_id)
+                        .map(|e| e.credentials.clone())
+                };
+
+                if let Some(creds) = credentials {
+                    if let Ok(ctx) = self.try_ensure_token(bound_id, &creds).await {
+                        self.affinity.touch(user_id);
+                        return Ok(ctx);
+                    }
+                }
+            }
+        }
+
+        // 绑定不存在或凭据不可用，选择使用频率最低的凭据（负载均衡）
+        let candidates: Vec<(u64, KiroCredentials)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .map(|e| (e.id, e.credentials.clone()))
+                .collect()
+        };
+
+        let least_used = {
+            let cache = self.balance_cache.lock();
+            candidates
+                .into_iter()
+                .min_by_key(|(id, _)| cache.get(id).map(|c| c.recent_usage).unwrap_or(0))
+        };
+
+        if let Some((id, credentials)) = least_used {
+            if let Ok(ctx) = self.try_ensure_token(id, &credentials).await {
+                self.affinity.set(user_id, ctx.id);
+                return Ok(ctx);
+            }
+        }
+
+        // 回退到默认逻辑（按优先级选择）
+        let ctx = self.acquire_context().await?;
+        self.affinity.set(user_id, ctx.id);
+        Ok(ctx)
+    }
+
+    /// 获取缓存的余额（用于故障转移选择）
+    fn get_cached_balance(&self, id: u64) -> f64 {
+        let cache = self.balance_cache.lock();
+        if let Some(entry) = cache.get(&id) {
+            // 动态 TTL：低余额 > 低频 > 高频
+            let ttl = if entry.remaining < LOW_BALANCE_THRESHOLD {
+                BALANCE_TTL_LOW_BALANCE_SECS
+            } else if entry.recent_usage >= HIGH_FREQ_THRESHOLD {
+                BALANCE_TTL_HIGH_FREQ_SECS
+            } else {
+                BALANCE_TTL_LOW_FREQ_SECS
+            };
+            if entry.cached_at.elapsed().as_secs() < ttl {
+                return entry.remaining;
+            }
+        }
+        // 缓存不存在或过期，返回 0（会回退到优先级选择）
+        0.0
+    }
+
+    /// 更新余额缓存
+    pub fn update_balance_cache(&self, id: u64, remaining: f64) {
+        let mut cache = self.balance_cache.lock();
+        let now = std::time::Instant::now();
+        // 保留现有使用计数
+        let (recent_usage, usage_reset_at) = cache
+            .get(&id)
+            .map(|e| (e.recent_usage, e.usage_reset_at))
+            .unwrap_or((0, now));
+        cache.insert(
+            id,
+            CachedBalance {
+                remaining,
+                cached_at: now,
+                recent_usage,
+                usage_reset_at,
+            },
+        );
+    }
+
+    /// 检查是否需要刷新余额缓存
+    pub fn should_refresh_balance(&self, id: u64) -> bool {
+        let cache = self.balance_cache.lock();
+        if let Some(entry) = cache.get(&id) {
+            // remaining == 0.0 表示未初始化，需要立即刷新
+            if entry.remaining == 0.0 {
+                return true;
+            }
+            // 使用动态 TTL 判断是否过期
+            let ttl = if entry.remaining < LOW_BALANCE_THRESHOLD {
+                BALANCE_TTL_LOW_BALANCE_SECS
+            } else if entry.recent_usage >= HIGH_FREQ_THRESHOLD {
+                BALANCE_TTL_HIGH_FREQ_SECS
+            } else {
+                BALANCE_TTL_LOW_FREQ_SECS
+            };
+            entry.cached_at.elapsed().as_secs() >= ttl
+        } else {
+            true // 无缓存，需要刷新
+        }
+    }
+
+    /// 记录凭据使用（用于动态 TTL 计算和负载均衡）
+    pub fn record_usage(&self, id: u64) {
+        let mut cache = self.balance_cache.lock();
+        let now = std::time::Instant::now();
+        if let Some(entry) = cache.get_mut(&id) {
+            // 重置周期过期则清零
+            if entry.usage_reset_at.elapsed().as_secs() >= USAGE_COUNT_RESET_SECS {
+                entry.recent_usage = 1;
+                entry.usage_reset_at = now;
+            } else {
+                entry.recent_usage = entry.recent_usage.saturating_add(1);
+            }
+        } else {
+            // 缓存条目不存在时创建新条目（余额未知设为 0）
+            cache.insert(
+                id,
+                CachedBalance {
+                    remaining: 0.0,
+                    cached_at: now,
+                    recent_usage: 1,
+                    usage_reset_at: now,
+                },
+            );
         }
     }
 
@@ -832,6 +1040,9 @@ impl MultiTokenManager {
         // 重置 MODEL_TEMPORARILY_UNAVAILABLE 计数器
         self.model_unavailable_count.store(0, Ordering::SeqCst);
 
+        // 记录使用次数（用于动态 TTL）
+        self.record_usage(id);
+
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             entry.failure_count = 0;
@@ -870,22 +1081,40 @@ impl MultiTokenManager {
             entry.disable_reason = Some(DisableReason::FailureLimit);
             tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
-            // 切换到优先级最高的可用凭据
-            if let Some(next) = entries
+            // 移除该凭据的亲和性绑定
+            self.affinity.remove_by_credential(id);
+
+            // 收集可用凭据 ID 和优先级
+            let available: Vec<(u64, u32)> = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
+                .map(|e| (e.id, e.credentials.priority))
+                .collect();
+
+            // 释放 entries 锁后查询余额缓存
+            drop(entries);
+
+            // 按余额选择，余额相同时按优先级
+            if let Some((next_id, _)) = available.iter().max_by(|(id_a, pri_a), (id_b, pri_b)| {
+                let bal_a = self.get_cached_balance(*id_a);
+                let bal_b = self.get_cached_balance(*id_b);
+                bal_a
+                    .partial_cmp(&bal_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| pri_b.cmp(pri_a)) // 优先级小的更优
+            }) {
+                *current_id = *next_id;
                 tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
+                    "已切换到凭据 #{}（余额: {:.2}）",
+                    next_id,
+                    self.get_cached_balance(*next_id)
                 );
             } else {
                 tracing::error!("所有凭据均已禁用！");
                 return false;
             }
+
+            return true;
         }
 
         // 检查是否还有可用凭据
