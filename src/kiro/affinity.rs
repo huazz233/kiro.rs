@@ -39,9 +39,11 @@ impl UserAffinityManager {
         let mut map = self.affinity.lock();
         if let Some(entry) = map.get(user_id) {
             if entry.last_used.elapsed() < self.ttl {
+                tracing::debug!(user_id = %user_id, credential_id = %entry.credential_id, "亲和性命中");
                 return Some(entry.credential_id);
             }
             // 过期则删除
+            tracing::debug!(user_id = %user_id, credential_id = %entry.credential_id, "亲和性过期，已清除");
             map.remove(user_id);
         }
         None
@@ -49,6 +51,7 @@ impl UserAffinityManager {
 
     /// 设置用户与凭据的绑定
     pub fn set(&self, user_id: &str, credential_id: u64) {
+        tracing::debug!(user_id = %user_id, credential_id = %credential_id, "建立亲和性绑定");
         let mut map = self.affinity.lock();
         map.insert(
             user_id.to_string(),

@@ -76,11 +76,15 @@ pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 提取 user_id 用于凭据亲和性
+    let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
+
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        user_id = ?user_id,
         "Received POST /v1/messages request"
     );
     // 检查 KiroProvider 是否可用
@@ -157,9 +161,6 @@ pub async fn post_messages(
         .as_ref()
         .map(|t| t.thinking_type == "enabled")
         .unwrap_or(false);
-
-    // 提取 user_id 用于凭据亲和性
-    let user_id = payload.metadata.as_ref().and_then(|m| m.user_id.as_deref());
 
     if payload.stream {
         // 流式响应

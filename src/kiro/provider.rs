@@ -243,6 +243,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                tracing::info!(credential_id = %ctx.id, "API 请求成功");
                 // 后台异步刷新余额缓存
                 self.spawn_balance_refresh(ctx.id);
                 return Ok(response);

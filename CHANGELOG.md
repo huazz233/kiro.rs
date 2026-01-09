@@ -27,6 +27,14 @@
 - 修复手动查询余额后列表页面不显示缓存余额的问题
   - `get_balance()` 成功后调用 `update_balance_cache()` 更新缓存
   - 现在点击"查看余额"后，列表页面会正确显示缓存的余额值
+- 修复关闭余额弹窗后卡片不更新缓存余额的问题
+  - 弹窗关闭时调用 `queryClient.invalidateQueries({ queryKey: ['cached-balances'] })`
+  - 确保卡片和弹窗使用的两个独立数据源保持同步
+
+### Changed
+- 增强 Token 刷新日志，添加凭证 ID 追踪
+  - 新增 `refresh_token_with_id()` 函数支持传入凭证 ID
+  - 日志现在包含 `credential_id` 字段，便于多凭据环境下的问题排查
 
 ### Changed
 - 调整重试策略：单凭据最大重试次数 3→2，单请求最大重试次数 9→5

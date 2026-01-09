@@ -188,7 +188,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
         open={balanceDialogOpen}
         onOpenChange={(open) => {
           setBalanceDialogOpen(open)
-          if (!open) setForceRefreshBalance(false)
+          if (!open) {
+            setForceRefreshBalance(false)
+            // 关闭弹窗时刷新缓存余额，让卡片显示最新数据
+            queryClient.invalidateQueries({ queryKey: ['cached-balances'] })
+          }
         }}
         forceRefresh={forceRefreshBalance}
       />

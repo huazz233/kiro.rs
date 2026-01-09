@@ -133,14 +133,26 @@ pub(crate) async fn refresh_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
+    // 使用凭据自身的 ID（如果有）
+    let id = credentials.id.unwrap_or(0);
+    refresh_token_with_id(credentials, config, proxy, id).await
+}
+
+/// 刷新 Token（带凭证 ID）
+pub(crate) async fn refresh_token_with_id(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+    id: u64,
+) -> anyhow::Result<KiroCredentials> {
     validate_refresh_token(credentials)?;
 
     // 根据 auth_method 选择刷新方式
     let auth_method = credentials.auth_method.as_deref().unwrap_or("social");
 
     match auth_method.to_lowercase().as_str() {
-        "idc" | "builder-id" => refresh_idc_token(credentials, config, proxy).await,
-        _ => refresh_social_token(credentials, config, proxy).await,
+        "idc" | "builder-id" => refresh_idc_token(credentials, config, proxy, id).await,
+        _ => refresh_social_token(credentials, config, proxy, id).await,
     }
 }
 
@@ -149,8 +161,9 @@ async fn refresh_social_token(
     credentials: &KiroCredentials,
     config: &Config,
     proxy: Option<&ProxyConfig>,
+    id: u64,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 Social Token...");
+    tracing::info!(credential_id = %id, "正在刷新 Social Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     let region = &config.region;
@@ -210,6 +223,9 @@ async fn refresh_social_token(
     if let Some(expires_in) = data.expires_in {
         let expires_at = Utc::now() + Duration::seconds(expires_in);
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
+        tracing::info!(credential_id = %id, expires_in = %expires_in, "Social Token 刷新成功");
+    } else {
+        tracing::info!(credential_id = %id, "Social Token 刷新成功（无过期时间）");
     }
 
     Ok(new_credentials)
@@ -223,8 +239,9 @@ async fn refresh_idc_token(
     credentials: &KiroCredentials,
     config: &Config,
     proxy: Option<&ProxyConfig>,
+    id: u64,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 IdC Token...");
+    tracing::info!(credential_id = %id, "正在刷新 IdC Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     let client_id = credentials
@@ -287,6 +304,9 @@ async fn refresh_idc_token(
     if let Some(expires_in) = data.expires_in {
         let expires_at = Utc::now() + Duration::seconds(expires_in);
         new_credentials.expires_at = Some(expires_at.to_rfc3339());
+        tracing::info!(credential_id = %id, expires_in = %expires_in, "IdC Token 刷新成功");
+    } else {
+        tracing::info!(credential_id = %id, "IdC Token 刷新成功（无过期时间）");
     }
 
     Ok(new_credentials)
@@ -1011,7 +1031,8 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
+                    refresh_token_with_id(&current_creds, &self.config, self.proxy.as_ref(), id)
+                        .await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1440,7 +1461,8 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, self.proxy.as_ref()).await?;
+                    refresh_token_with_id(&current_creds, &self.config, self.proxy.as_ref(), id)
+                        .await?;
                 {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
