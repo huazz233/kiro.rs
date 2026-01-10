@@ -411,16 +411,18 @@ struct CredentialEntry {
     failure_count: u32,
     /// 是否已禁用
     disabled: bool,
-    /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
-    disabled_reason: Option<DisabledReason>,
+    /// 自愈原因（用于区分手动禁用 vs 自动禁用，便于自愈逻辑判断）
+    auto_heal_reason: Option<AutoHealReason>,
+    /// 禁用原因（公共 API 展示用）
+    disable_reason: Option<DisableReason>,
 }
 
-/// 禁用原因
+/// 自愈原因（内部使用，用于判断是否可自动恢复）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
-    /// Admin API 手动禁用
+enum AutoHealReason {
+    /// Admin API 手动禁用（不自动恢复）
     Manual,
-    /// 连续失败达到阈值后自动禁用
+    /// 连续失败达到阈值后自动禁用（可自动恢复）
     TooManyFailures,
 }
 
@@ -589,7 +591,8 @@ impl MultiTokenManager {
                     credentials: cred,
                     failure_count: 0,
                     disabled: false,
-                    disabled_reason: None,
+                    auto_heal_reason: None,
+                    disable_reason: None,
                 }
             })
             .collect();
@@ -723,16 +726,18 @@ impl MultiTokenManager {
                     // 没有可用凭据：如果是“自动禁用导致全灭”，做一次类似重启的自愈
                     if best.is_none()
                         && entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                            e.disabled
+                                && e.auto_heal_reason == Some(AutoHealReason::TooManyFailures)
                         })
                     {
                         tracing::warn!(
                             "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
                         );
                         for e in entries.iter_mut() {
-                            if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                            if e.auto_heal_reason == Some(AutoHealReason::TooManyFailures) {
                                 e.disabled = false;
-                                e.disabled_reason = None;
+                                e.auto_heal_reason = None;
+                                e.disable_reason = None;
                                 e.failure_count = 0;
                             }
                         }
@@ -1197,7 +1202,8 @@ impl MultiTokenManager {
 
         if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
             entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+            entry.auto_heal_reason = Some(AutoHealReason::TooManyFailures);
+            entry.disable_reason = Some(DisableReason::FailureLimit);
             tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
             // 移除该凭据的亲和性绑定
@@ -1359,6 +1365,7 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             entry.disabled = true;
+            entry.auto_heal_reason = None; // 清除自愈原因，防止被自愈循环错误恢复
             entry.disable_reason = Some(DisableReason::InsufficientBalance);
             tracing::warn!("凭据 #{} 已标记为余额不足", id);
         }
@@ -1423,9 +1430,11 @@ impl MultiTokenManager {
             if !disabled {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
-                entry.disabled_reason = None;
+                entry.auto_heal_reason = None;
+                entry.disable_reason = None;
             } else {
-                entry.disabled_reason = Some(DisabledReason::Manual);
+                entry.auto_heal_reason = Some(AutoHealReason::Manual);
+                entry.disable_reason = Some(DisableReason::Manual);
             }
         }
         // 持久化更改
@@ -1463,7 +1472,8 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.failure_count = 0;
             entry.disabled = false;
-            entry.disabled_reason = None;
+            entry.auto_heal_reason = None;
+            entry.disable_reason = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -1575,7 +1585,8 @@ impl MultiTokenManager {
                 credentials: validated_cred,
                 failure_count: 0,
                 disabled: false,
-                disabled_reason: None,
+                auto_heal_reason: None,
+                disable_reason: None,
             });
         }
 

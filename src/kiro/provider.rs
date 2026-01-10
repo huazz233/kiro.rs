@@ -283,7 +283,12 @@ impl KiroProvider {
                     );
                 }
 
-                last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
                 continue;
             }
 
@@ -297,7 +302,12 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -317,7 +327,12 @@ impl KiroProvider {
                 status,
                 body
             );
-            last_error = Some(anyhow::anyhow!("{} API 请求失败: {} {}", api_type, status, body));
+            last_error = Some(anyhow::anyhow!(
+                "{} API 请求失败: {} {}",
+                api_type,
+                status,
+                body
+            ));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }

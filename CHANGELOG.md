@@ -2,7 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+- 修复合并上游后 `CredentialEntry` 结构体字段缺失导致的编译错误
+  - 添加 `disable_reason: Option<DisableReason>` 字段（公共 API 展示用）
+  - 添加 `auto_heal_reason: Option<AutoHealReason>` 字段（内部自愈逻辑用）
+- 修复禁用原因字段不同步问题
+  - `report_failure()`: 禁用时同步设置两个字段
+  - `set_disabled()`: 启用/禁用时同步设置/清除两个字段
+  - `reset_and_enable()`: 重置时同步清除两个字段
+  - 自愈循环：重新启用凭据时同步清除 `disable_reason`
+  - `mark_insufficient_balance()`: 清除 `auto_heal_reason` 防止被自愈循环错误恢复
+
 ### Changed
+- 重命名内部字段以提高可读性
+  - `DisabledReason` → `AutoHealReason`（自愈原因枚举）
+  - `disabled_reason` → `auto_heal_reason`（自愈原因字段）
 - 日志中的 `user_id` 现在会进行掩码处理，保护用户隐私
   - 长度 > 25：保留前13后8字符（如 `user_f516339a***897ac7`）
   - 长度 13-25：保留前4后4字符
