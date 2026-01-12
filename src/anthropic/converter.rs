@@ -312,29 +312,51 @@ fn validate_tool_pairing(history: &[Message], tool_results: &[ToolResult]) -> Ve
     use std::collections::HashSet;
 
     // 1. 收集所有历史中的 tool_use_id
-    let mut valid_tool_use_ids: HashSet<String> = HashSet::new();
+    let mut all_tool_use_ids: HashSet<String> = HashSet::new();
+    // 2. 收集历史中已经有 tool_result 的 tool_use_id
+    let mut history_tool_result_ids: HashSet<String> = HashSet::new();
 
     for msg in history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                for tool_use in tool_uses {
-                    valid_tool_use_ids.insert(tool_use.tool_use_id.clone());
+        match msg {
+            Message::Assistant(assistant_msg) => {
+                if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+                    for tool_use in tool_uses {
+                        all_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                    }
+                }
+            }
+            Message::User(user_msg) => {
+                // 收集历史 user 消息中的 tool_results
+                for result in &user_msg.user_input_message.user_input_message_context.tool_results
+                {
+                    history_tool_result_ids.insert(result.tool_use_id.clone());
                 }
             }
         }
     }
 
-    // 2. 过滤并验证 tool_results
+    // 3. 计算真正未配对的 tool_use_ids（排除历史中已配对的）
+    let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
+        .difference(&history_tool_result_ids)
+        .cloned()
+        .collect();
+
+    // 4. 过滤并验证当前消息的 tool_results
     let mut filtered_results = Vec::new();
 
     for result in tool_results {
-        if valid_tool_use_ids.contains(&result.tool_use_id) {
+        if unpaired_tool_use_ids.contains(&result.tool_use_id) {
             // 配对成功
             filtered_results.push(result.clone());
-            // 从集合中移除，用于后续检测孤立 tool_use
-            valid_tool_use_ids.remove(&result.tool_use_id);
+            unpaired_tool_use_ids.remove(&result.tool_use_id);
+        } else if all_tool_use_ids.contains(&result.tool_use_id) {
+            // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
+            tracing::warn!(
+                "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
+                result.tool_use_id
+            );
         } else {
-            // 孤立 tool_result - 静默跳过并输出警告
+            // 孤立 tool_result - 找不到对应的 tool_use
             tracing::warn!(
                 "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
                 result.tool_use_id
@@ -342,8 +364,8 @@ fn validate_tool_pairing(history: &[Message], tool_results: &[ToolResult]) -> Ve
         }
     }
 
-    // 3. 检测孤立的 tool_use（有 tool_use 但没有对应的 tool_result）
-    for orphaned_id in &valid_tool_use_ids {
+    // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
+    for orphaned_id in &unpaired_tool_use_ids {
         tracing::warn!(
             "检测到孤立的 tool_use：找不到对应的 tool_result，tool_use_id={}",
             orphaned_id
@@ -963,5 +985,87 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].tool_use_id, "tool-1");
         // tool-2 是孤立的 tool_use（无 result），tool-3 是孤立的 tool_result
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_history_already_paired() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试历史中已配对的 tool_use 不应该被报告为孤立
+        // 场景：多轮对话中，之前的 tool_use 已经在历史中有对应的 tool_result
+        let mut assistant_msg1 = AssistantMessage::new("I'll read the file.");
+        assistant_msg1 = assistant_msg1.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+
+        // 构建历史中的 user 消息，包含 tool_result
+        let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
+        let mut ctx = UserInputMessageContext::new();
+        ctx = ctx.with_tool_results(vec![ToolResult::success("tool-1", "file content")]);
+        user_msg_with_result = user_msg_with_result.with_context(ctx);
+
+        let history = vec![
+            // 第一轮：用户请求
+            Message::User(HistoryUserMessage::new(
+                "Read the file",
+                "claude-sonnet-4.5",
+            )),
+            // 第一轮：assistant 使用工具
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg1,
+            }),
+            // 第二轮：用户返回工具结果（历史中已配对）
+            Message::User(HistoryUserMessage {
+                user_input_message: user_msg_with_result,
+            }),
+            // 第二轮：assistant 响应
+            Message::Assistant(HistoryAssistantMessage::new("The file contains...")),
+        ];
+
+        // 当前消息没有 tool_results（用户只是继续对话）
+        let tool_results: Vec<ToolResult> = vec![];
+
+        let filtered = validate_tool_pairing(&history, &tool_results);
+
+        // 结果应该为空，且不应该有孤立 tool_use 的警告
+        // 因为 tool-1 已经在历史中配对了
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_duplicate_result() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 测试重复的 tool_result（历史中已配对，当前消息又发送了相同的 tool_result）
+        let mut assistant_msg = AssistantMessage::new("I'll read the file.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![ToolUseEntry::new("tool-1", "read")
+            .with_input(serde_json::json!({"path": "/test.txt"}))]);
+
+        // 历史中已有 tool_result
+        let mut user_msg_with_result = UserMessage::new("", "claude-sonnet-4.5");
+        let mut ctx = UserInputMessageContext::new();
+        ctx = ctx.with_tool_results(vec![ToolResult::success("tool-1", "file content")]);
+        user_msg_with_result = user_msg_with_result.with_context(ctx);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new(
+                "Read the file",
+                "claude-sonnet-4.5",
+            )),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+            Message::User(HistoryUserMessage {
+                user_input_message: user_msg_with_result,
+            }),
+            Message::Assistant(HistoryAssistantMessage::new("Done")),
+        ];
+
+        // 当前消息又发送了相同的 tool_result（重复）
+        let tool_results = vec![ToolResult::success("tool-1", "file content again")];
+
+        let filtered = validate_tool_pairing(&history, &tool_results);
+
+        // 重复的 tool_result 应该被过滤掉
+        assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");
     }
 }
