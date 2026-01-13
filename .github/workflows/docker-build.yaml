@@ -2,7 +2,14 @@ name: Build and Push Docker Images
 
 on:
   push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag for Docker images (e.g., 2025.12.1)'
+        required: true
+        default: '2026.1.1'
 
 permissions:
   contents: read
@@ -45,7 +52,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:latest-${{ matrix.arch }}
+          tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ github.event.inputs.version || github.ref_name }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
