@@ -17,6 +17,9 @@
   - 涉及文件：`src/kiro/token_manager.rs`
 
 ### Fixed
+- 修复 assistant 消息仅包含 tool_use 时 content 为空导致 Kiro API 报错的问题
+  - 当 text_content 为空且存在 tool_uses 时，使用 "OK" 作为占位符
+  - 涉及文件：`src/anthropic/converter.rs`
 - 修复 `MODEL_TEMPORARILY_UNAVAILABLE` 错误检测逻辑未实际调用的问题
   - 在 `call_mcp()` 和 `call_api()` 中添加错误检测和熔断触发逻辑
   - 移除 `report_model_unavailable()` 和 `disable_all_credentials()` 的 `#[allow(dead_code)]` 标记

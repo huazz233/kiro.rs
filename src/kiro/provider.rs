@@ -15,9 +15,6 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 
-#[cfg(test)]
-use crate::kiro::model::credentials::KiroCredentials;
-
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 2;
 
