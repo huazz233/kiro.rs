@@ -101,9 +101,6 @@ pub struct MessagesRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
-    /// system 字段支持两种格式：
-    /// - 字符串格式: "You are a helpful assistant"
-    /// - 数组格式: [{"type": "text", "text": "You are a helpful assistant"}]
     #[serde(default, deserialize_with = "deserialize_system")]
     pub system: Option<Vec<SystemMessage>>,
     /// tools 可以是普通 Tool 或 WebSearchTool 等多种格式，使用 Value 灵活处理
@@ -115,37 +112,58 @@ pub struct MessagesRequest {
     pub metadata: Option<Metadata>,
 }
 
-/// 反序列化 system 字段，支持字符串和数组两种格式
+/// 反序列化 system 字段，支持字符串或数组格式
 fn deserialize_system<'de, D>(deserializer: D) -> Result<Option<Vec<SystemMessage>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
+    // 创建一个 visitor 来处理 string 或 array
+    struct SystemVisitor;
 
-    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    impl<'de> serde::de::Visitor<'de> for SystemVisitor {
+        type Value = Option<Vec<SystemMessage>>;
 
-    match value {
-        None => Ok(None),
-        Some(serde_json::Value::String(s)) => {
-            // 字符串格式：转换为单元素数组
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or an array of system messages")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
             Ok(Some(vec![SystemMessage {
                 message_type: default_message_type(),
-                text: s,
+                text: value.to_string(),
             }]))
         }
-        Some(serde_json::Value::Array(arr)) => {
-            // 数组格式：解析为 Vec<SystemMessage>
-            let messages: Result<Vec<SystemMessage>, _> = arr
-                .into_iter()
-                .map(|v| serde_json::from_value(v).map_err(D::Error::custom))
-                .collect();
-            Ok(Some(messages?))
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut messages = Vec::new();
+            while let Some(msg) = seq.next_element()? {
+                messages.push(msg);
+            }
+            Ok(if messages.is_empty() { None } else { Some(messages) })
         }
-        Some(other) => Err(D::Error::custom(format!(
-            "system 字段必须是字符串或数组，收到: {:?}",
-            other
-        ))),
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            serde::de::Deserialize::deserialize(deserializer)
+        }
     }
+
+    deserializer.deserialize_any(SystemVisitor)
 }
 
 fn default_max_tokens() -> i32 {
@@ -213,9 +231,11 @@ pub struct ImageSource {
 pub struct CountTokensRequest {
     pub model: String,
     pub messages: Vec<Message>,
-    /// system 字段支持两种格式（与 MessagesRequest 保持一致）
-    #[serde(default, deserialize_with = "deserialize_system")]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_system"
+    )]
     pub system: Option<Vec<SystemMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<serde_json::Value>>,
