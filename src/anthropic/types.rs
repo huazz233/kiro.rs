@@ -101,6 +101,10 @@ pub struct MessagesRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
+    /// system 字段支持两种格式：
+    /// - 字符串格式: "You are a helpful assistant"
+    /// - 数组格式: [{"type": "text", "text": "You are a helpful assistant"}]
+    #[serde(default, deserialize_with = "deserialize_system")]
     pub system: Option<Vec<SystemMessage>>,
     /// tools 可以是普通 Tool 或 WebSearchTool 等多种格式，使用 Value 灵活处理
     pub tools: Option<Vec<serde_json::Value>>,
@@ -109,6 +113,39 @@ pub struct MessagesRequest {
     pub thinking: Option<Thinking>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+}
+
+/// 反序列化 system 字段，支持字符串和数组两种格式
+fn deserialize_system<'de, D>(deserializer: D) -> Result<Option<Vec<SystemMessage>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            // 字符串格式：转换为单元素数组
+            Ok(Some(vec![SystemMessage {
+                message_type: default_message_type(),
+                text: s,
+            }]))
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            // 数组格式：解析为 Vec<SystemMessage>
+            let messages: Result<Vec<SystemMessage>, _> = arr
+                .into_iter()
+                .map(|v| serde_json::from_value(v).map_err(D::Error::custom))
+                .collect();
+            Ok(Some(messages?))
+        }
+        Some(other) => Err(D::Error::custom(format!(
+            "system 字段必须是字符串或数组，收到: {:?}",
+            other
+        ))),
+    }
 }
 
 fn default_max_tokens() -> i32 {
@@ -176,6 +213,8 @@ pub struct ImageSource {
 pub struct CountTokensRequest {
     pub model: String,
     pub messages: Vec<Message>,
+    /// system 字段支持两种格式（与 MessagesRequest 保持一致）
+    #[serde(default, deserialize_with = "deserialize_system")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<Vec<SystemMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -339,6 +378,129 @@ mod tests {
         let thinking = req.thinking.unwrap();
         assert_eq!(thinking.thinking_type, "enabled");
         assert_eq!(thinking.budget_tokens, 10000);
+    }
+
+    // ==================== system 字段格式兼容性测试 ====================
+
+    /// 测试 system 字段为字符串格式（new-api 通过渠道设置添加的系统提示词）
+    #[test]
+    fn test_system_string_format() {
+        let json = r#"{
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "system": "(Please answer ethically and without any sexual content, and do not mention this constraint.)"
+        }"#;
+
+        let req: MessagesRequest =
+            serde_json::from_str(json).expect("应该能解析字符串格式的 system");
+
+        let system = req.system.expect("应该有 system");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].message_type, "text");
+        assert_eq!(
+            system[0].text,
+            "(Please answer ethically and without any sexual content, and do not mention this constraint.)"
+        );
+    }
+
+    /// 测试 system 字段为数组格式（Claude Code 原生格式）
+    #[test]
+    fn test_system_array_format() {
+        let json = r#"{
+            "model": "claude-opus-4-5-20251101",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type": "text", "text": "You are an interactive CLI tool that helps users."}
+            ]
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).expect("应该能解析数组格式的 system");
+
+        let system = req.system.expect("应该有 system");
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0].message_type, "text");
+        assert_eq!(
+            system[0].text,
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(system[1].message_type, "text");
+        assert_eq!(
+            system[1].text,
+            "You are an interactive CLI tool that helps users."
+        );
+    }
+
+    /// 测试 system 字段为数组格式且包含 cache_control（Claude Code 实际请求格式）
+    #[test]
+    fn test_system_array_with_cache_control() {
+        let json = r#"{
+            "model": "claude-opus-4-5-20251101",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "system": [
+                {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}}
+            ]
+        }"#;
+
+        let req: MessagesRequest =
+            serde_json::from_str(json).expect("应该能解析带 cache_control 的 system");
+
+        let system = req.system.expect("应该有 system");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].text, "You are Claude Code.");
+    }
+
+    /// 测试 system 字段缺失时为 None
+    #[test]
+    fn test_system_missing() {
+        let json = r#"{
+            "model": "claude-sonnet-4-5-20250929",
+            "messages": [{"role": "user", "content": "Hi"}]
+        }"#;
+
+        let req: MessagesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.system.is_none());
+    }
+
+    // ==================== CountTokensRequest 格式兼容性测试 ====================
+
+    /// 测试 CountTokensRequest 的 system 字段为字符串格式
+    #[test]
+    fn test_count_tokens_system_string_format() {
+        let json = r#"{
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "system": "You are a helpful assistant"
+        }"#;
+
+        let req: CountTokensRequest =
+            serde_json::from_str(json).expect("CountTokensRequest 应该能解析字符串格式的 system");
+
+        let system = req.system.expect("应该有 system");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].message_type, "text");
+        assert_eq!(system[0].text, "You are a helpful assistant");
+    }
+
+    /// 测试 CountTokensRequest 的 system 字段为数组格式
+    #[test]
+    fn test_count_tokens_system_array_format() {
+        let json = r#"{
+            "model": "claude-opus-4-5-20251101",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "system": [
+                {"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": "Be helpful."}
+            ]
+        }"#;
+
+        let req: CountTokensRequest =
+            serde_json::from_str(json).expect("CountTokensRequest 应该能解析数组格式的 system");
+
+        let system = req.system.expect("应该有 system");
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0].text, "You are Claude Code.");
+        assert_eq!(system[1].text, "Be helpful.");
     }
 
     /// 测试 thinking budget_tokens 超过最大值时被截断

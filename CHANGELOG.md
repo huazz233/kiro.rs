@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- 新增 `system` 字段格式兼容性支持（`src/anthropic/types.rs`）
+  - 支持字符串格式：`"system": "You are a helpful assistant"`（new-api 等网关添加的系统提示词）
+  - 支持数组格式：`"system": [{"type": "text", "text": "..."}]`（Claude Code 原生格式）
+  - 自动将字符串格式转换为单元素数组，保持内部处理一致性
+  - 新增 6 个单元测试验证格式兼容性
 - 新增请求体大小限制：50MB（`DefaultBodyLimit::max(50 * 1024 * 1024)`）
   - 涉及文件：`src/anthropic/router.rs`
 
