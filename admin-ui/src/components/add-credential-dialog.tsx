@@ -17,7 +17,7 @@ interface AddCredentialDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc' | 'builder-id'
+type AuthMethod = 'social' | 'idc'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
@@ -45,10 +45,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       return
     }
 
-    // IdC/Builder-ID 需要额外字段
-    if ((authMethod === 'idc' || authMethod === 'builder-id') &&
-        (!clientId.trim() || !clientSecret.trim())) {
-      toast.error('IdC/Builder-ID 认证需要填写 Client ID 和 Client Secret')
+    // IdC/Builder-ID/IAM 需要额外字段
+    if (authMethod === 'idc' && (!clientId.trim() || !clientSecret.trim())) {
+      toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
       return
     }
 
@@ -110,13 +109,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <option value="social">Social</option>
-                <option value="idc">IdC</option>
-                <option value="builder-id">Builder-ID</option>
+                <option value="idc">IdC/Builder-ID/IAM</option>
               </select>
             </div>
 
-            {/* IdC/Builder-ID 额外字段 */}
-            {(authMethod === 'idc' || authMethod === 'builder-id') && (
+            {/* IdC/Builder-ID/IAM 额外字段 */}
+            {authMethod === 'idc' && (
               <>
                 <div className="space-y-2">
                   <label htmlFor="clientId" className="text-sm font-medium">

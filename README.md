@@ -88,7 +88,7 @@ cargo build --release
    "refreshToken": "这里是刷新token 一般有效期7-30天不等",  // 必配, 根据实际填写
    "profileArn": "这是profileArn, 如果没有请你删除该字段， 配置应该像这个 arn:aws:codewhisperer:us-east-1:111112222233:profile/QWER1QAZSDFGH",  // 可选, 不需要请删除
    "expiresAt": "这里是请求token过期时间, 一般格式是这样2025-12-31T02:32:45.144Z, 在过期前 kirors 不会请求刷新请求token",  // 必配, 不确定你需要写一个已经过期的UTC时间
-   "authMethod": "这里是认证方式 social / idc / builder-id",  // 必配, 根据你 Token 登录来源决定
+   "authMethod": "这里是认证方式 social / idc / builder-id / iam",  // 必配, 其中 idc/builder-id/iam 实际为同一种登录方式
    "clientId": "如果你是 IdC 登录 需要配置这个",  // 可选, 不需要请删除
    "clientSecret": "如果你是 IdC 登录 需要配置这个"  // 可选, 不需要请删除
 }
@@ -204,7 +204,7 @@ curl http://127.0.0.1:8990/v1/messages \
 | `refreshToken` | string | OAuth 刷新令牌              |
 | `profileArn` | string | AWS Profile ARN（可选，登录时返回） |
 | `expiresAt` | string | Token 过期时间 (RFC3339)    |
-| `authMethod` | string | 认证方式（`social` / `idc` / `builder-id`） |
+| `authMethod` | string | 认证方式（`social` / `idc` / `builder-id` / `iam`，后三者等价） |
 | `clientId` | string | IdC 登录的客户端 ID（可选）      |
 | `clientSecret` | string | IdC 登录的客户端密钥（可选）      |
 | `priority` | number | 凭据优先级，数字越小越优先，默认为 0（多凭据格式时有效）|

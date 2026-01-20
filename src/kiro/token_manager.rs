@@ -141,9 +141,13 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    match auth_method.to_lowercase().as_str() {
-        "idc" | "builder-id" => refresh_idc_token(credentials, config, proxy).await,
-        _ => refresh_social_token(credentials, config, proxy).await,
+    if auth_method.eq_ignore_ascii_case("idc")
+        || auth_method.eq_ignore_ascii_case("builder-id")
+        || auth_method.eq_ignore_ascii_case("iam")
+    {
+        refresh_idc_token(credentials, config, proxy).await
+    } else {
+        refresh_social_token(credentials, config, proxy).await
     }
 }
 
@@ -497,6 +501,7 @@ impl MultiTokenManager {
         let entries: Vec<CredentialEntry> = credentials
             .into_iter()
             .map(|mut cred| {
+                cred.canonicalize_auth_method();
                 let id = cred.id.unwrap_or_else(|| {
                     let id = next_id;
                     next_id += 1;
@@ -825,7 +830,14 @@ impl MultiTokenManager {
         // 收集所有凭据
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
-            entries.iter().map(|e| e.credentials.clone()).collect()
+            entries
+                .iter()
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    cred
+                })
+                .collect()
         };
 
         // 序列化为 pretty JSON
@@ -1011,7 +1023,13 @@ impl MultiTokenManager {
                     priority: e.credentials.priority,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
-                    auth_method: e.credentials.auth_method.clone(),
+                    auth_method: e.credentials.auth_method.as_deref().map(|m| {
+                        if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            "idc".to_string()
+                        } else {
+                            m.to_string()
+                        }
+                    }),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
                 })
@@ -1174,7 +1192,13 @@ impl MultiTokenManager {
         // 4. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
-        validated_cred.auth_method = new_cred.auth_method;
+        validated_cred.auth_method = new_cred.auth_method.map(|m| {
+            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                "idc".to_string()
+            } else {
+                m
+            }
+        });
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
 
