@@ -22,6 +22,7 @@ type AuthMethod = 'social' | 'idc'
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
+  const [region, setRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
@@ -31,6 +32,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const resetForm = () => {
     setRefreshToken('')
     setAuthMethod('social')
+    setRegion('')
     setClientId('')
     setClientSecret('')
     setPriority('0')
@@ -55,6 +57,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         refreshToken: refreshToken.trim(),
         authMethod,
+        region: region.trim() || undefined,
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
@@ -111,6 +114,19 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <option value="social">Social</option>
                 <option value="idc">IdC/Builder-ID/IAM</option>
               </select>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="region" className="text-sm font-medium">
+                刷新 Token 地域
+              </label>
+              <Input
+                id="region"
+                placeholder="例如 us-east-1（留空则使用全局 region）"
+                value={region}
+                onChange={(e) => setRegion(e.target.value)}
+                disabled={isPending}
+              />
             </div>
 
             {/* IdC/Builder-ID/IAM 额外字段 */}

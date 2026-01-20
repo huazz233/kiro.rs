@@ -1201,6 +1201,8 @@ impl MultiTokenManager {
         });
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.region = new_cred.region;
+        validated_cred.machine_id = new_cred.machine_id;
 
         {
             let mut entries = self.entries.lock();
