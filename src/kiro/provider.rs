@@ -6,6 +6,7 @@
 
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -257,6 +258,7 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut forced_token_refresh: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // 获取调用上下文
@@ -341,6 +343,20 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                // bearer token 失效：优先触发刷新再重试（避免因 expiresAt 不准导致误判/误禁用）
+                if Self::is_invalid_bearer_token(&body) && forced_token_refresh.insert(ctx.id) {
+                    tracing::warn!(
+                        "MCP 请求失败（Bearer token 无效，触发刷新后重试，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    self.token_manager.invalidate_access_token(ctx.id);
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue;
+                }
+
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -410,6 +426,7 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut forced_token_refresh: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         for attempt in 0..max_retries {
@@ -433,12 +450,24 @@ impl KiroProvider {
             // 克隆 headers 用于错误日志（原 headers 会被 move）
             let headers_for_log = headers.clone();
 
+            // 动态注入当前凭据的 profile_arn（修复 IDC 凭据 403 问题）
+            // IDC 凭据的 Token 刷新不返回 profile_arn，需要使用凭据自身的 profile_arn
+            let final_body = match Self::inject_profile_arn(request_body, &ctx.credentials) {
+                Ok(body) => body,
+                Err(e) => {
+                    tracing::warn!("注入 profile_arn 失败，使用原始请求体: {}", e);
+                    request_body.to_string()
+                }
+            };
+            // 克隆 final_body 用于错误日志（原 final_body 会被 move 到 body()）
+            let final_body_for_log = final_body.clone();
+
             // 发送请求
             let response = match self
                 .client
                 .post(&url)
                 .headers(headers)
-                .body(request_body.to_string())
+                .body(final_body)
                 .send()
                 .await
             {
@@ -511,7 +540,7 @@ impl KiroProvider {
                     response_body = %body,
                     request_url = %url,
                     request_headers = %Self::format_headers_for_log(&headers_for_log),
-                    request_body = %request_body,
+                    request_body = %final_body_for_log,
                     "400 Bad Request - 请求格式错误"
                 );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
@@ -519,6 +548,25 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                // bearer token 失效：优先触发刷新再重试（避免因 expiresAt 不准导致误判/误禁用）
+                if Self::is_invalid_bearer_token(&body) && forced_token_refresh.insert(ctx.id) {
+                    tracing::warn!(
+                        "API 请求失败（Bearer token 无效，触发刷新后重试，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    self.token_manager.invalidate_access_token(ctx.id);
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -602,6 +650,41 @@ impl KiroProvider {
         }))
     }
 
+    /// 动态注入当前凭据的 profile_arn 到请求体
+    ///
+    /// 解决 IDC 凭据 403 问题：IDC 凭据的 Token 刷新不返回 profile_arn，
+    /// 但 API 调用需要 profile_arn 与 Bearer Token 匹配。
+    ///
+    /// # 行为
+    /// - 如果凭据有 profile_arn，覆盖请求体中的 profileArn 字段
+    /// - 如果凭据没有 profile_arn，保持请求体不变
+    fn inject_profile_arn(
+        request_body: &str,
+        credentials: &crate::kiro::model::credentials::KiroCredentials,
+    ) -> anyhow::Result<String> {
+        // 凭据没有 profile_arn 时，直接返回原始请求体
+        let Some(profile_arn) = &credentials.profile_arn else {
+            return Ok(request_body.to_string());
+        };
+
+        // 解析请求体为 JSON
+        let mut request: serde_json::Value = serde_json::from_str(request_body)?;
+
+        // 安全检查：确保是对象类型，避免在非对象 JSON 上 panic
+        let obj = request
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("request body is not a JSON object"))?;
+
+        // 注入 profile_arn（覆盖原有值）
+        obj.insert(
+            "profileArn".to_string(),
+            serde_json::Value::String(profile_arn.clone()),
+        );
+
+        // 序列化回字符串
+        Ok(serde_json::to_string(&request)?)
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -658,6 +741,15 @@ impl KiroProvider {
             .pointer("/error/reason")
             .and_then(|v| v.as_str())
             .is_some_and(|v| v == "MODEL_TEMPORARILY_UNAVAILABLE")
+    }
+
+    /// 检测是否为「bearer token invalid」类错误
+    ///
+    /// 典型返回：
+    /// `{"message":"The bearer token included in the request is invalid.","reason":null}`
+    fn is_invalid_bearer_token(body: &str) -> bool {
+        let lower = body.to_ascii_lowercase();
+        lower.contains("bearer token") && lower.contains("invalid")
     }
 
     /// 格式化 HeaderMap 为可读字符串（用于日志输出）
@@ -767,5 +859,72 @@ mod tests {
     fn test_is_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!KiroProvider::is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_is_invalid_bearer_token_true() {
+        let body =
+            r#"{"message":"The bearer token included in the request is invalid.","reason":null}"#;
+        assert!(KiroProvider::is_invalid_bearer_token(body));
+    }
+
+    #[test]
+    fn test_is_invalid_bearer_token_false() {
+        let body = r#"{"message":"Forbidden","reason":null}"#;
+        assert!(!KiroProvider::is_invalid_bearer_token(body));
+    }
+
+    #[test]
+    fn test_inject_profile_arn_with_credential_arn() {
+        // 凭据有 profile_arn 时，应覆盖请求体中的 profileArn
+        let mut credentials = KiroCredentials::default();
+        credentials.profile_arn = Some("arn:aws:sso::111111111:profile/idc-profile".to_string());
+
+        let request_body =
+            r#"{"conversationState":{},"profileArn":"arn:aws:sso::999999999:profile/old"}"#;
+        let result = KiroProvider::inject_profile_arn(request_body, &credentials).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["profileArn"].as_str().unwrap(),
+            "arn:aws:sso::111111111:profile/idc-profile"
+        );
+    }
+
+    #[test]
+    fn test_inject_profile_arn_without_credential_arn() {
+        // 凭据没有 profile_arn 时，应保持请求体不变
+        let credentials = KiroCredentials::default();
+        assert!(credentials.profile_arn.is_none());
+
+        let request_body =
+            r#"{"conversationState":{},"profileArn":"arn:aws:sso::999999999:profile/original"}"#;
+        let result = KiroProvider::inject_profile_arn(request_body, &credentials).unwrap();
+
+        // 应返回原始请求体（未修改）
+        assert_eq!(result, request_body);
+    }
+
+    #[test]
+    fn test_inject_profile_arn_adds_missing_field() {
+        // 请求体没有 profileArn 字段时，应添加
+        let mut credentials = KiroCredentials::default();
+        credentials.profile_arn = Some("arn:aws:sso::222222222:profile/new".to_string());
+
+        let request_body = r#"{"conversationState":{"conversationId":"test"}}"#;
+        let result = KiroProvider::inject_profile_arn(request_body, &credentials).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["profileArn"].as_str().unwrap(),
+            "arn:aws:sso::222222222:profile/new"
+        );
+        // 确保原有字段保留
+        assert_eq!(
+            parsed["conversationState"]["conversationId"]
+                .as_str()
+                .unwrap(),
+            "test"
+        );
     }
 }

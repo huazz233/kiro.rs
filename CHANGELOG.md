@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- 修复 IDC 凭据返回 403 "The bearer token included in the request is invalid" 的问题
+  - 根本原因：`profile_arn` 只从第一个凭据获取并存储在全局 `AppState` 中，当使用 IDC 凭据时，Bearer Token 来自 IDC 凭据，但 `profile_arn` 来自第一个凭据（可能是 Social 类型），导致 Token 和 profile_arn 不匹配
+  - 解决方案：在 `call_api_with_retry` 中动态注入当前凭据的 `profile_arn`，确保 Token 和 profile_arn 始终匹配
+  - 新增 `inject_profile_arn()` 辅助方法，解析请求体 JSON 并覆盖 `profileArn` 字段
+  - 涉及文件：`src/kiro/provider.rs`
+
 ### Added
 - 新增批量导入 token.json 功能
   - 后端：新增 `POST /api/admin/credentials/import-token-json` 端点
