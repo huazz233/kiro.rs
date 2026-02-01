@@ -403,22 +403,20 @@ fn remove_orphaned_tool_uses(
     }
 
     for msg in history.iter_mut() {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) =
-                assistant_msg.assistant_response_message.tool_uses
-            {
-                let original_len = tool_uses.len();
-                tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
+        if let Message::Assistant(assistant_msg) = msg
+            && let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses
+        {
+            let original_len = tool_uses.len();
+            tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
 
-                // 如果移除后为空，设置为 None
-                if tool_uses.is_empty() {
-                    assistant_msg.assistant_response_message.tool_uses = None;
-                } else if tool_uses.len() != original_len {
-                    tracing::debug!(
-                        "从 assistant 消息中移除了 {} 个孤立的 tool_use",
-                        original_len - tool_uses.len()
-                    );
-                }
+            // 如果移除后为空，设置为 None
+            if tool_uses.is_empty() {
+                assistant_msg.assistant_response_message.tool_uses = None;
+            } else if tool_uses.len() != original_len {
+                tracing::debug!(
+                    "从 assistant 消息中移除了 {} 个孤立的 tool_use",
+                    original_len - tool_uses.len()
+                );
             }
         }
     }
