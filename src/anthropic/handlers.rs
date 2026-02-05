@@ -184,7 +184,7 @@ pub async fn post_messages(
     };
 
     #[cfg(feature = "sensitive-logs")]
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!("Kiro request body: {}", truncate_middle(&request_body, 200));
     #[cfg(not(feature = "sensitive-logs"))]
     tracing::debug!(
         kiro_request_body_bytes = request_body.len(),
@@ -673,7 +673,7 @@ pub async fn post_messages_cc(
     };
 
     #[cfg(feature = "sensitive-logs")]
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!("Kiro request body: {}", truncate_middle(&request_body, 200));
     #[cfg(not(feature = "sensitive-logs"))]
     tracing::debug!(
         kiro_request_body_bytes = request_body.len(),
@@ -856,4 +856,40 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+/// 截断字符串中间部分，保留头尾各 `keep` 个字符
+///
+/// 用于 debug 日志：避免输出过长的请求体，同时保留足够上下文便于排查。
+/// 正确处理 UTF-8 多字节字符边界，不会截断中文。
+#[cfg(feature = "sensitive-logs")]
+fn truncate_middle(s: &str, keep: usize) -> std::borrow::Cow<'_, str> {
+    // 按字符数计算，避免截断后反而更长
+    let char_count = s.chars().count();
+    let min_omit = 30; // 省略号 + 数字的最小开销，确保截断有意义
+    if char_count <= keep * 2 + min_omit {
+        return std::borrow::Cow::Borrowed(s);
+    }
+
+    // 找到第 keep 个字符的字节边界
+    let head_end = s
+        .char_indices()
+        .nth(keep)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+
+    // 找到倒数第 keep 个字符的字节边界
+    let tail_start = s
+        .char_indices()
+        .nth_back(keep - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let omitted = s.len() - head_end - (s.len() - tail_start);
+    std::borrow::Cow::Owned(format!(
+        "{}...({} bytes omitted)...{}",
+        &s[..head_end],
+        omitted,
+        &s[tail_start..]
+    ))
 }

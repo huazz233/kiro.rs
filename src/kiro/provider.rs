@@ -878,6 +878,7 @@ impl KiroProvider {
     /// 目标：
     /// - 保留关键错误信息（例如 "Input is too long" / "Improperly formed request"）
     /// - 避免返回过长/不可控的内容导致客户端难以区分或处理
+    #[cfg(not(feature = "sensitive-logs"))]
     fn summarize_error_body(body: &str) -> String {
         const MAX_LEN: usize = 256;
         let trimmed = body.trim();
@@ -917,6 +918,7 @@ impl KiroProvider {
         Self::truncate_one_line(trimmed, MAX_LEN)
     }
 
+    #[cfg(not(feature = "sensitive-logs"))]
     fn truncate_one_line(s: &str, max_len: usize) -> String {
         let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
         if one_line.len() <= max_len {
@@ -1091,6 +1093,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sensitive-logs"))]
     fn test_summarize_error_body_extracts_message_and_reason() {
         let body =
             r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
@@ -1100,6 +1103,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sensitive-logs"))]
     fn test_summarize_error_body_extracts_nested_message_and_reason() {
         let body = r#"{"error":{"message":"Improperly formed request","reason":"BAD_REQUEST"}}"#;
         let summary = KiroProvider::summarize_error_body(body);
@@ -1108,6 +1112,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sensitive-logs"))]
     fn test_summarize_error_body_truncates_long_text() {
         let body = "x".repeat(1000);
         let summary = KiroProvider::summarize_error_body(&body);
