@@ -173,6 +173,55 @@ impl RateLimiter {
         Ok(())
     }
 
+    /// 尝试获取一次“发送许可”（原子检查 + 占位）
+    ///
+    /// `check_rate_limit()` 仅做检查，不会更新状态，无法在并发场景下避免“同时放行”。
+    /// 本方法在同一把锁内完成检查与 `last_request_at` 更新，用于：
+    /// - 限制单个凭据的请求频率（近似 RPM/最小间隔）
+    /// - 在并发请求下将流量自然分流到其他可用凭据
+    ///
+    /// 返回 `Ok(())` 表示已占用一个发送窗口；`Err(Duration)` 表示需要等待的时间。
+    pub fn try_acquire(&self, credential_id: u64) -> Result<(), Duration> {
+        let min_interval = self.calculate_interval();
+
+        let mut states = self.states.lock();
+        let state = states.entry(credential_id).or_default();
+        let now = Instant::now();
+
+        // 检查是否需要重置每日计数
+        if now >= state.count_reset_at {
+            state.daily_count = 0;
+            state.count_reset_at = now + Duration::from_secs(86400);
+        }
+
+        // 检查每日限制
+        if state.daily_count >= self.config.daily_max_requests {
+            let wait_time = state.count_reset_at.saturating_duration_since(now);
+            return Err(wait_time);
+        }
+
+        // 检查退避状态
+        if let Some(backoff_until) = state.backoff_until {
+            if now < backoff_until {
+                return Err(backoff_until.saturating_duration_since(now));
+            }
+            // 退避已结束，清除状态
+            state.backoff_until = None;
+        }
+
+        // 检查请求间隔
+        if let Some(last_request) = state.last_request_at {
+            let elapsed = now.saturating_duration_since(last_request);
+            if elapsed < min_interval {
+                return Err(min_interval - elapsed);
+            }
+        }
+
+        // 占位：更新上次请求时间，避免并发下同一凭据被同时放行
+        state.last_request_at = Some(now);
+        Ok(())
+    }
+
     /// 记录请求成功
     pub fn record_success(&self, credential_id: u64) {
         let mut states = self.states.lock();

@@ -69,6 +69,16 @@ pub struct Config {
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
+
+    /// 单个凭据的目标请求速率（RPM，每分钟请求数）
+    ///
+    /// 用于凭据级节流/分流：当某个凭据短时间内请求过密时，优先将流量分配到其他可用凭据，
+    /// 从而减少上游 429 的概率。
+    ///
+    /// - `None` 或 `0`: 使用内置默认节流策略
+    /// - `>0`: 将最小/最大请求间隔固定为 `60_000 / rpm` 毫秒
+    #[serde(default)]
+    pub credential_rpm: Option<u32>,
 }
 
 fn default_host() -> String {
@@ -123,6 +133,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            credential_rpm: None,
         }
     }
 }

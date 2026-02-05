@@ -651,6 +651,19 @@ impl MultiTokenManager {
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
     ) -> anyhow::Result<Self> {
+        let rate_limit_config = {
+            let mut cfg = RateLimitConfig::default();
+            if let Some(rpm) = config.credential_rpm.filter(|&v| v > 0) {
+                // RPM -> 固定间隔（ms），例如 20 RPM => 3000ms
+                let interval_ms = (60_000u64 / rpm as u64).max(1);
+                cfg.min_interval_ms = interval_ms;
+                cfg.max_interval_ms = interval_ms;
+                // 固定间隔下抖动无意义，避免反复计算造成误差
+                cfg.jitter_percent = 0.0;
+            }
+            cfg
+        };
+
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
         let mut next_id = max_existing_id + 1;
@@ -739,7 +752,7 @@ impl MultiTokenManager {
             global_recovery_time: Mutex::new(None),
             affinity: UserAffinityManager::new(),
             balance_cache: Mutex::new(initial_cache),
-            rate_limiter: RateLimiter::new(RateLimitConfig::default()),
+            rate_limiter: RateLimiter::new(rate_limit_config),
             cooldown_manager: CooldownManager::new(),
             background_refresher: None,
         };
@@ -829,9 +842,17 @@ impl MultiTokenManager {
 
         let total = self.total_count();
         let mut tried_ids: Vec<u64> = Vec::new();
+        // 当所有凭据都因“临时不可用”（冷却/速率限制）被跳过时，等待最短可用时间再重试。
+        let mut min_wait: Option<std::time::Duration> = None;
 
         loop {
             if tried_ids.len() >= total {
+                if let Some(wait) = min_wait {
+                    tokio::time::sleep(wait).await;
+                    tried_ids.clear();
+                    min_wait = None;
+                    continue;
+                }
                 anyhow::bail!(
                     "所有凭据均无法获取有效 Token（可用: {}/{}）",
                     self.available_count(),
@@ -892,6 +913,18 @@ impl MultiTokenManager {
                 .select_best_candidate_id(&candidate_ids)
                 .ok_or_else(|| anyhow::anyhow!("没有可用凭据"))?;
 
+            // 冷却/速率限制：把“临时不可用”的凭据视为本轮不可选，从而自然分流到其他凭据。
+            if let Some((_, remaining)) = self.cooldown_manager.check_cooldown(id) {
+                min_wait = Some(min_wait.map(|w| w.min(remaining)).unwrap_or(remaining));
+                tried_ids.push(id);
+                continue;
+            }
+            if let Err(wait) = self.rate_limiter.try_acquire(id) {
+                min_wait = Some(min_wait.map(|w| w.min(wait)).unwrap_or(wait));
+                tried_ids.push(id);
+                continue;
+            }
+
             let credentials = {
                 let entries = self.entries.lock();
                 entries
@@ -928,64 +961,52 @@ impl MultiTokenManager {
             _ => return self.acquire_context().await,
         };
 
-        // 检查亲和性绑定
+        // 默认保持用户绑定（用于连续对话）。当绑定凭据“临时不可用”（速率限制/短冷却）时，
+        // 允许分流到其他凭据，但不强制重绑，避免频繁抖动。
+        let mut keep_affinity_binding = false;
+
         if let Some(bound_id) = self.affinity.get(user_id) {
-            // 检查绑定的凭据是否可用
-            let is_available = {
+            let is_enabled = {
                 let entries = self.entries.lock();
                 entries.iter().any(|e| e.id == bound_id && !e.disabled)
             };
 
-            if is_available {
-                // 尝试使用绑定的凭据
-                let credentials = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == bound_id)
-                        .map(|e| e.credentials.clone())
-                };
+            if is_enabled {
+                if let Some((reason, _)) = self.cooldown_manager.check_cooldown(bound_id) {
+                    // 对“长冷却”原因不保留绑定，避免长期命中后每次都先失败再回退。
+                    keep_affinity_binding = matches!(
+                        reason,
+                        CooldownReason::RateLimitExceeded
+                            | CooldownReason::TokenRefreshFailed
+                            | CooldownReason::ServerError
+                            | CooldownReason::ModelUnavailable
+                    );
+                } else if let Ok(()) = self.rate_limiter.try_acquire(bound_id) {
+                    let credentials = {
+                        let entries = self.entries.lock();
+                        entries
+                            .iter()
+                            .find(|e| e.id == bound_id)
+                            .map(|e| e.credentials.clone())
+                    };
 
-                if let Some(creds) = credentials
-                    && let Ok(ctx) = self.try_ensure_token(bound_id, &creds).await
-                {
-                    self.affinity.touch(user_id);
-                    return Ok(ctx);
+                    if let Some(creds) = credentials
+                        && let Ok(ctx) = self.try_ensure_token(bound_id, &creds).await
+                    {
+                        self.affinity.touch(user_id);
+                        return Ok(ctx);
+                    }
+                } else {
+                    // 速率限制是短期现象，保留绑定但允许本次分流
+                    keep_affinity_binding = true;
                 }
             }
         }
 
-        // 绑定不存在或凭据不可用，选择最优凭据（两级判断：使用次数最少 + 余额最多）
-        let candidates: Vec<u64> = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .map(|e| e.id)
-                .collect()
-        };
-
-        let best_candidate = self.select_best_candidate_id(&candidates);
-
-        if let Some(id) = best_candidate {
-            let credentials = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .find(|e| e.id == id)
-                    .map(|e| e.credentials.clone())
-            };
-            if let Some(creds) = credentials
-                && let Ok(ctx) = self.try_ensure_token(id, &creds).await
-            {
-                self.affinity.set(user_id, ctx.id);
-                return Ok(ctx);
-            }
-        }
-
-        // 回退到默认逻辑（按优先级选择）
         let ctx = self.acquire_context().await?;
-        self.affinity.set(user_id, ctx.id);
+        if !keep_affinity_binding {
+            self.affinity.set(user_id, ctx.id);
+        }
         Ok(ctx)
     }
 
