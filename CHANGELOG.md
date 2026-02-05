@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+- 限制 `max_tokens` 最大值为 32000（Kiro 上游限制）
+  - 当用户设置超出限制的值时自动调整为 32000
+  - 记录 WARN 级别日志，包含原始值和调整后的值
+  - 涉及文件：`src/anthropic/handlers.rs`
+- 工具输入 JSON 解析失败时输出完整 Kiro 请求体
+  - 注意：日志可能包含敏感信息且体积较大，仅用于排查问题
+  - 涉及文件：`src/anthropic/handlers.rs`
+- 修复 Kiro 上游请求兼容性问题
+  - 空 content（仅 tool_result/image）时使用占位符避免 400
+  - 规范化工具 JSON Schema、补全空 description
+  - 禁用 reqwest 系统代理探测（仅支持显式 `config.proxy_url`）
+  - 新增离线诊断脚本：`tools/diagnose_improper_request.py`
+  - 涉及文件：`src/anthropic/converter.rs`、`src/http_client.rs`、`tools/diagnose_improper_request.py`、`.gitignore`
+
 ### Changed
 - 优化 400 Bad Request "输入过长" 错误的日志输出 (`src/kiro/provider.rs`)
   - 对于 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` / `Input is too long` 错误，不再输出完整请求体（太占空间且无调试价值）
