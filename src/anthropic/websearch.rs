@@ -593,7 +593,7 @@ async fn call_mcp_api(
     #[cfg(feature = "sensitive-logs")]
     tracing::debug!("MCP request: {}", request_body);
     #[cfg(not(feature = "sensitive-logs"))]
-    tracing::debug!(mcp_request_len = request_body.len(), "已构建 MCP 请求体");
+    tracing::debug!(mcp_request_bytes = request_body.len(), "已构建 MCP 请求体");
 
     let response = provider.call_mcp(&request_body).await?;
 
@@ -601,7 +601,7 @@ async fn call_mcp_api(
     #[cfg(feature = "sensitive-logs")]
     tracing::debug!("MCP response: {}", body);
     #[cfg(not(feature = "sensitive-logs"))]
-    tracing::debug!(mcp_response_len = body.len(), "收到 MCP 响应");
+    tracing::debug!(mcp_response_bytes = body.len(), "收到 MCP 响应");
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;
 

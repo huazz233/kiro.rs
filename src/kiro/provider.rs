@@ -336,7 +336,7 @@ impl KiroProvider {
                     let estimated_tokens = Self::estimate_tokens(request_body);
                     tracing::error!(
                         status = %status,
-                        response_body = %body,
+                        response_body_bytes = body.len(),
                         request_url = %url,
                         request_body_bytes = body_bytes,
                         estimated_input_tokens = estimated_tokens,
@@ -356,13 +356,16 @@ impl KiroProvider {
                     #[cfg(not(feature = "sensitive-logs"))]
                     tracing::error!(
                         status = %status,
-                        response_body = %body,
+                        response_body_bytes = body.len(),
                         request_url = %url,
                         request_body_bytes = request_body.len(),
                         "MCP 400 Bad Request - 请求格式错误"
                     );
                 }
+                #[cfg(feature = "sensitive-logs")]
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
+                #[cfg(not(feature = "sensitive-logs"))]
+                anyhow::bail!("MCP 请求失败: {} (response {} bytes)", status, body.len());
             }
 
             // 401/403 凭据问题
@@ -565,7 +568,7 @@ impl KiroProvider {
                     let estimated_tokens = Self::estimate_tokens(&final_body_for_log);
                     tracing::error!(
                         status = %status,
-                        response_body = %body,
+                        response_body_bytes = body.len(),
                         request_url = %url,
                         request_body_bytes = body_bytes,
                         estimated_input_tokens = estimated_tokens,
@@ -585,13 +588,16 @@ impl KiroProvider {
                     #[cfg(not(feature = "sensitive-logs"))]
                     tracing::error!(
                         status = %status,
-                        response_body = %body,
+                        response_body_bytes = body.len(),
                         request_url = %url,
                         request_body_bytes = final_body_for_log.len(),
                         "400 Bad Request - 请求格式错误"
                     );
                 }
+                #[cfg(feature = "sensitive-logs")]
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                #[cfg(not(feature = "sensitive-logs"))]
+                anyhow::bail!("{} API 请求失败: {} (response {} bytes)", api_type, status, body.len());
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移

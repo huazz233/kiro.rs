@@ -332,7 +332,7 @@ mod tests {
         let refresher = BackgroundRefresher::with_defaults();
 
         // 启动一个空的刷新任务
-        refresher.start(|_id| Box::pin(async { true }), |_mins| vec![]);
+        let _ = refresher.start(|_id| Box::pin(async { true }), |_mins| vec![]);
 
         // 等待启动
         tokio::time::sleep(Duration::from_millis(100)).await;
