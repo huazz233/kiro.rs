@@ -330,8 +330,9 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                let is_too_long = Self::is_input_too_long(&body);
                 // 输入过长错误：只记录请求体大小，不输出完整内容（太占空间且无调试价值）
-                if Self::is_input_too_long(&body) {
+                if is_too_long {
                     let body_bytes = request_body.len();
                     let estimated_tokens = Self::estimate_tokens(request_body);
                     tracing::error!(
@@ -365,7 +366,21 @@ impl KiroProvider {
                 #[cfg(feature = "sensitive-logs")]
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
                 #[cfg(not(feature = "sensitive-logs"))]
-                anyhow::bail!("MCP 请求失败: {} (response {} bytes)", status, body.len());
+                {
+                    if is_too_long {
+                        let body_bytes = request_body.len();
+                        let estimated_tokens = Self::estimate_tokens(request_body);
+                        anyhow::bail!(
+                            "MCP 请求失败: {} Input is too long. (request_body_bytes={}, estimated_input_tokens={})",
+                            status,
+                            body_bytes,
+                            estimated_tokens
+                        );
+                    }
+
+                    let summary = Self::summarize_error_body(&body);
+                    anyhow::bail!("MCP 请求失败: {} {}", status, summary);
+                }
             }
 
             // 401/403 凭据问题
@@ -562,8 +577,9 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                let is_too_long = Self::is_input_too_long(&body);
                 // 输入过长错误：只记录请求体大小，不输出完整内容（太占空间且无调试价值）
-                if Self::is_input_too_long(&body) {
+                if is_too_long {
                     let body_bytes = final_body_for_log.len();
                     let estimated_tokens = Self::estimate_tokens(&final_body_for_log);
                     tracing::error!(
@@ -597,7 +613,23 @@ impl KiroProvider {
                 #[cfg(feature = "sensitive-logs")]
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
                 #[cfg(not(feature = "sensitive-logs"))]
-                anyhow::bail!("{} API 请求失败: {} (response {} bytes)", api_type, status, body.len());
+                {
+                    // 对用户保留可区分的错误信息（例如 Input is too long），但避免返回过长内容。
+                    if is_too_long {
+                        let body_bytes = final_body_for_log.len();
+                        let estimated_tokens = Self::estimate_tokens(&final_body_for_log);
+                        anyhow::bail!(
+                            "{} API 请求失败: {} Input is too long. (request_body_bytes={}, estimated_input_tokens={})",
+                            api_type,
+                            status,
+                            body_bytes,
+                            estimated_tokens
+                        );
+                    }
+
+                    let summary = Self::summarize_error_body(&body);
+                    anyhow::bail!("{} API 请求失败: {} {}", api_type, status, summary);
+                }
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -841,6 +873,60 @@ impl KiroProvider {
         body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || body.contains("Input is too long")
     }
 
+    /// 从上游响应体提取一个适合返回给客户端的错误摘要
+    ///
+    /// 目标：
+    /// - 保留关键错误信息（例如 "Input is too long" / "Improperly formed request"）
+    /// - 避免返回过长/不可控的内容导致客户端难以区分或处理
+    fn summarize_error_body(body: &str) -> String {
+        const MAX_LEN: usize = 256;
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return "<empty response body>".to_string();
+        }
+
+        // 优先尝试解析 JSON，从常见字段中提取 message / reason。
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let message = value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("Message").and_then(|v| v.as_str()))
+                .or_else(|| value.pointer("/error/message").and_then(|v| v.as_str()))
+                .or_else(|| value.pointer("/error/Message").and_then(|v| v.as_str()));
+
+            let reason = value
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("Reason").and_then(|v| v.as_str()))
+                .or_else(|| value.pointer("/error/reason").and_then(|v| v.as_str()))
+                .or_else(|| value.pointer("/error/Reason").and_then(|v| v.as_str()));
+
+            if let Some(msg) = message {
+                let mut s = msg.to_string();
+                if let Some(r) = reason.filter(|r| !r.is_empty() && *r != "null") {
+                    // 避免重复拼接（有些上游会把 reason 直接写入 message）
+                    if !msg.contains(r) {
+                        s.push_str(&format!(" (reason={})", r));
+                    }
+                }
+                return Self::truncate_one_line(&s, MAX_LEN);
+            }
+        }
+
+        // JSON 解析失败或不含常见字段，回退到压缩后的纯文本。
+        Self::truncate_one_line(trimmed, MAX_LEN)
+    }
+
+    fn truncate_one_line(s: &str, max_len: usize) -> String {
+        let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one_line.len() <= max_len {
+            return one_line;
+        }
+
+        let end = one_line.floor_char_boundary(max_len);
+        format!("{}...", &one_line[..end])
+    }
+
     /// 估算文本的 token 数量
     ///
     /// 基于字符类型的估算公式：
@@ -1002,6 +1088,31 @@ mod tests {
     fn test_is_invalid_bearer_token_false() {
         let body = r#"{"message":"Forbidden","reason":null}"#;
         assert!(!KiroProvider::is_invalid_bearer_token(body));
+    }
+
+    #[test]
+    fn test_summarize_error_body_extracts_message_and_reason() {
+        let body =
+            r#"{"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#;
+        let summary = KiroProvider::summarize_error_body(body);
+        assert!(summary.contains("Input is too long"));
+        assert!(summary.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD"));
+    }
+
+    #[test]
+    fn test_summarize_error_body_extracts_nested_message_and_reason() {
+        let body = r#"{"error":{"message":"Improperly formed request","reason":"BAD_REQUEST"}}"#;
+        let summary = KiroProvider::summarize_error_body(body);
+        assert!(summary.contains("Improperly formed request"));
+        assert!(summary.contains("BAD_REQUEST"));
+    }
+
+    #[test]
+    fn test_summarize_error_body_truncates_long_text() {
+        let body = "x".repeat(1000);
+        let summary = KiroProvider::summarize_error_body(&body);
+        assert!(summary.len() <= 256 + 3);
+        assert!(summary.ends_with("..."));
     }
 
     #[test]
