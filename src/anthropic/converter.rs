@@ -69,11 +69,13 @@ pub fn map_model(model: &str) -> Option<String> {
 
     if model_lower.contains("sonnet") {
         Some("claude-sonnet-4.5".to_string())
-    } else if model_lower.contains("opus") {
+    } else if model_lower.contains("claude-opus-4.5") {
         Some("claude-opus-4.5".to_string())
+    } else if model_lower.contains("claude-opus-4.6") {
+        Some("claude-opus-4.6".to_string())
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
-    } else {
+    }else {
         None
     }
 }
