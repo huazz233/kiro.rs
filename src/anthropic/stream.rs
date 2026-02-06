@@ -634,8 +634,10 @@ impl StreamContext {
                 // 查找 <thinking> 开始标签（跳过被反引号包裹的）
                 if let Some(start_pos) = find_real_thinking_start_tag(&self.thinking_buffer) {
                     // 发送 <thinking> 之前的内容作为 text_delta
+                    // 注意：如果前面只是空白字符（如 adaptive 模式返回的 \n\n），则跳过，
+                    // 避免在 thinking 块之前产生无意义的 text 块导致客户端解析失败
                     let before_thinking = self.thinking_buffer[..start_pos].to_string();
-                    if !before_thinking.is_empty() {
+                    if !before_thinking.is_empty() && !before_thinking.trim().is_empty() {
                         events.extend(self.create_text_delta_events(&before_thinking));
                     }
 
@@ -670,10 +672,15 @@ impl StreamContext {
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        if !safe_content.is_empty() {
+                        // 如果 thinking 尚未提取，且安全内容只是空白字符，
+                        // 则不发送为 text_delta，继续保留在缓冲区等待更多内容。
+                        // 这避免了 4.6 模型中 <thinking> 标签跨事件分割时，
+                        // 前导空白（如 "\n\n"）被错误地创建为 text 块，
+                        // 导致 text 块先于 thinking 块出现的问题。
+                        if !safe_content.is_empty() && !safe_content.trim().is_empty() {
                             events.extend(self.create_text_delta_events(&safe_content));
+                            self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                         }
-                        self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                     }
                     break;
                 }
