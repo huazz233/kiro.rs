@@ -103,7 +103,9 @@ pub fn map_model(model: &str) -> Option<String> {
 
     if model_lower.contains("sonnet") {
         Some("claude-sonnet-4.5".to_string())
-    } else if model_lower.contains("opus") {
+    } else if model_lower.contains("opus-4-6") {  // 先检查更具体的（注意是连字符）
+        Some("claude-opus-4.6".to_string())
+    } else if model_lower.contains("opus-4-5") {      // 再检查通用的
         Some("claude-opus-4.5".to_string())
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
