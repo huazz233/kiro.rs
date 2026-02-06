@@ -38,6 +38,14 @@ pub struct CredentialStatusItem {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// 刷新令牌（用于前端重复检测）
+    pub refresh_token: Option<String>,
+    /// 用户邮箱（用于前端显示）
+    pub email: Option<String>,
+    /// API 调用成功次数
+    pub success_count: u64,
+    /// 最后一次 API 调用时间（RFC3339 格式）
+    pub last_used_at: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -100,12 +108,15 @@ pub struct AddCredentialResponse {
     pub message: String,
     /// 新添加的凭据 ID
     pub credential_id: u64,
+    /// 用户邮箱（如果获取成功）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 // ============ 余额查询 ============
 
 /// 余额查询响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BalanceResponse {
     /// 凭据 ID
@@ -122,6 +133,24 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+}
+
+// ============ 负载均衡配置 ============
+
+/// 负载均衡模式响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadBalancingModeResponse {
+    /// 当前模式（"priority" 或 "balanced"）
+    pub mode: String,
+}
+
+/// 设置负载均衡模式请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLoadBalancingModeRequest {
+    /// 模式（"priority" 或 "balanced"）
+    pub mode: String,
 }
 
 // ============ 通用响应 ============

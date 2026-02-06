@@ -6,9 +6,10 @@
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -388,6 +389,10 @@ struct CredentialEntry {
     disabled: bool,
     /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
     disabled_reason: Option<DisabledReason>,
+    /// API 调用成功次数
+    success_count: u64,
+    /// 最后一次 API 调用时间（RFC3339 格式）
+    last_used_at: Option<String>,
 }
 
 /// 禁用原因
@@ -399,6 +404,13 @@ enum DisabledReason {
     TooManyFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
     QuotaExceeded,
+}
+
+/// 统计数据持久化条目
+#[derive(Serialize, Deserialize)]
+struct StatsEntry {
+    success_count: u64,
+    last_used_at: Option<String>,
 }
 
 // ============================================================================
@@ -423,6 +435,10 @@ pub struct CredentialEntrySnapshot {
     pub has_profile_arn: bool,
     /// Token 过期时间
     pub expires_at: Option<String>,
+    /// API 调用成功次数
+    pub success_count: u64,
+    /// 最后一次 API 调用时间（RFC3339 格式）
+    pub last_used_at: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -456,6 +472,8 @@ pub struct MultiTokenManager {
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
+    /// 负载均衡模式（运行时可修改）
+    load_balancing_mode: Mutex<String>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -523,6 +541,8 @@ impl MultiTokenManager {
                     failure_count: 0,
                     disabled: false,
                     disabled_reason: None,
+                    success_count: 0,
+                    last_used_at: None,
                 }
             })
             .collect();
@@ -546,6 +566,7 @@ impl MultiTokenManager {
             .map(|e| e.id)
             .unwrap_or(0);
 
+        let load_balancing_mode = config.load_balancing_mode.clone();
         let manager = Self {
             config,
             proxy,
@@ -554,6 +575,7 @@ impl MultiTokenManager {
             refresh_lock: TokioMutex::new(()),
             credentials_path,
             is_multiple_format,
+            load_balancing_mode: Mutex::new(load_balancing_mode),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -564,6 +586,9 @@ impl MultiTokenManager {
                 tracing::info!("已补全凭据 ID/machineId 并写回配置文件");
             }
         }
+
+        // 加载持久化的统计数据（success_count, last_used_at）
+        manager.load_stats();
 
         Ok(manager)
     }
@@ -594,6 +619,41 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 根据负载均衡模式选择下一个凭据
+    ///
+    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
+    /// - balanced 模式：轮询选择可用凭据
+    fn select_next_credential(&self) -> Option<(u64, KiroCredentials)> {
+        let entries = self.entries.lock();
+        let available: Vec<_> = entries.iter().filter(|e| !e.disabled).collect();
+
+        if available.is_empty() {
+            return None;
+        }
+
+        let mode = self.load_balancing_mode.lock().clone();
+        let mode = mode.as_str();
+
+        match mode {
+            "balanced" => {
+                // Least-Used 策略：选择成功次数最少的凭据
+                // 平局时按优先级排序（数字越小优先级越高）
+                let entry = available
+                    .iter()
+                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+
+                Some((entry.id, entry.credentials.clone()))
+            }
+            _ => {
+                // priority 模式（默认）：选择优先级最高的
+                let entry = available
+                    .iter()
+                    .min_by_key(|e| e.credentials.priority)?;
+                Some((entry.id, entry.credentials.clone()))
+            }
+        }
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -615,51 +675,55 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let mut entries = self.entries.lock();
-                let current_id = *self.current_id.lock();
+                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                // 找到当前凭据
-                if let Some(entry) = entries.iter().find(|e| e.id == current_id && !e.disabled) {
-                    (entry.id, entry.credentials.clone())
+                // balanced 模式：每次请求都轮询选择，不固定 current_id
+                // priority 模式：优先使用 current_id 指向的凭据
+                let current_hit = if is_balanced {
+                    None
                 } else {
-                    // 当前凭据不可用，选择优先级最高的可用凭据
-                    let mut best = entries
+                    let entries = self.entries.lock();
+                    let current_id = *self.current_id.lock();
+                    entries
                         .iter()
-                        .filter(|e| !e.disabled)
-                        .min_by_key(|e| e.credentials.priority);
+                        .find(|e| e.id == current_id && !e.disabled)
+                        .map(|e| (e.id, e.credentials.clone()))
+                };
 
-                    // 没有可用凭据：如果是“自动禁用导致全灭”，做一次类似重启的自愈
-                    if best.is_none()
-                        && entries.iter().any(|e| {
+                if let Some(hit) = current_hit {
+                    hit
+                } else {
+                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                    let mut best = self.select_next_credential();
+
+                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
+                    if best.is_none() {
+                        let mut entries = self.entries.lock();
+                        if entries.iter().any(|e| {
                             e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        })
-                    {
-                        tracing::warn!(
-                            "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                        );
-                        for e in entries.iter_mut() {
-                            if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                e.disabled = false;
-                                e.disabled_reason = None;
-                                e.failure_count = 0;
+                        }) {
+                            tracing::warn!(
+                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                            );
+                            for e in entries.iter_mut() {
+                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                    e.disabled = false;
+                                    e.disabled_reason = None;
+                                    e.failure_count = 0;
+                                }
                             }
+                            drop(entries);
+                            best = self.select_next_credential();
                         }
-                        best = entries
-                            .iter()
-                            .filter(|e| !e.disabled)
-                            .min_by_key(|e| e.credentials.priority);
                     }
 
-                    if let Some(entry) = best {
-                        // 先提取数据
-                        let new_id = entry.id;
-                        let new_creds = entry.credentials.clone();
-                        drop(entries);
+                    if let Some((new_id, new_creds)) = best {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
                         (new_id, new_creds)
                     } else {
+                        let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
@@ -855,6 +919,78 @@ impl MultiTokenManager {
         Ok(true)
     }
 
+    /// 获取缓存目录（凭据文件所在目录）
+    pub fn cache_dir(&self) -> Option<PathBuf> {
+        self.credentials_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    }
+
+    /// 统计数据文件路径
+    fn stats_path(&self) -> Option<PathBuf> {
+        self.cache_dir().map(|d| d.join("kiro_stats.json"))
+    }
+
+    /// 从磁盘加载统计数据并应用到当前条目
+    fn load_stats(&self) {
+        let path = match self.stats_path() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return, // file doesn't exist on first run
+        };
+
+        let stats: HashMap<String, StatsEntry> = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("解析统计缓存失败，将忽略: {}", e);
+                return;
+            }
+        };
+
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            if let Some(s) = stats.get(&entry.id.to_string()) {
+                entry.success_count = s.success_count;
+                entry.last_used_at = s.last_used_at.clone();
+            }
+        }
+        tracing::info!("已从缓存加载 {} 条统计数据", stats.len());
+    }
+
+    /// 将当前统计数据持久化到磁盘
+    fn save_stats(&self) {
+        let path = match self.stats_path() {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Hold lock during serialize + write to prevent concurrent corruption
+        let entries = self.entries.lock();
+        let stats: HashMap<String, StatsEntry> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.id.to_string(),
+                    StatsEntry {
+                        success_count: e.success_count,
+                        last_used_at: e.last_used_at.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        match serde_json::to_string_pretty(&stats) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("保存统计缓存失败: {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("序列化统计数据失败: {}", e),
+        }
+    }
+
     /// 报告指定凭据 API 调用成功
     ///
     /// 重置该凭据的失败计数
@@ -862,11 +998,16 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            entry.failure_count = 0;
-            tracing::debug!("凭据 #{} API 调用成功", id);
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.failure_count = 0;
+                entry.success_count += 1;
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                tracing::debug!("凭据 #{} API 调用成功（累计 {} 次）", id, entry.success_count);
+            }
         }
+        self.save_stats();
     }
 
     /// 报告指定凭据 API 调用失败
@@ -877,28 +1018,81 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let mut entries = self.entries.lock();
-        let mut current_id = self.current_id.lock();
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
 
-        let entry = match entries.iter_mut().find(|e| e.id == id) {
-            Some(e) => e,
-            None => return entries.iter().any(|e| !e.disabled),
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            entry.failure_count += 1;
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            let failure_count = entry.failure_count;
+
+            tracing::warn!(
+                "凭据 #{} API 调用失败（{}/{}）",
+                id,
+                failure_count,
+                MAX_FAILURES_PER_CREDENTIAL
+            );
+
+            if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
+
+                // 切换到优先级最高的可用凭据
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|e| !e.disabled)
+                    .min_by_key(|e| e.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                }
+            }
+
+            entries.iter().any(|e| !e.disabled)
         };
+        self.save_stats();
+        result
+    }
 
-        entry.failure_count += 1;
-        let failure_count = entry.failure_count;
+    /// 报告指定凭据额度已用尽
+    ///
+    /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
+    /// - 立即禁用该凭据（不等待连续失败阈值）
+    /// - 切换到下一个可用凭据继续重试
+    /// - 返回是否还有可用凭据
+    pub fn report_quota_exhausted(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
 
-        tracing::warn!(
-            "凭据 #{} API 调用失败（{}/{}）",
-            id,
-            failure_count,
-            MAX_FAILURES_PER_CREDENTIAL
-        );
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
 
-        if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
             entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::TooManyFailures);
-            tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
+            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
@@ -912,59 +1106,14 @@ impl MultiTokenManager {
                     next.id,
                     next.credentials.priority
                 );
+                true
             } else {
                 tracing::error!("所有凭据均已禁用！");
-                return false;
+                false
             }
-        }
-
-        // 检查是否还有可用凭据
-        entries.iter().any(|e| !e.disabled)
-    }
-
-    /// 报告指定凭据额度已用尽
-    ///
-    /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
-    /// - 立即禁用该凭据（不等待连续失败阈值）
-    /// - 切换到下一个可用凭据继续重试
-    /// - 返回是否还有可用凭据
-    pub fn report_quota_exhausted(&self, id: u64) -> bool {
-        let mut entries = self.entries.lock();
-        let mut current_id = self.current_id.lock();
-
-        let entry = match entries.iter_mut().find(|e| e.id == id) {
-            Some(e) => e,
-            None => return entries.iter().any(|e| !e.disabled),
         };
-
-        if entry.disabled {
-            return entries.iter().any(|e| !e.disabled);
-        }
-
-        entry.disabled = true;
-        entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
-        // 设为阈值，便于在管理面板中直观看到该凭据已不可用
-        entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
-
-        tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
-
-        // 切换到优先级最高的可用凭据
-        if let Some(next) = entries
-            .iter()
-            .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
-        {
-            *current_id = next.id;
-            tracing::info!(
-                "已切换到凭据 #{}（优先级 {}）",
-                next.id,
-                next.credentials.priority
-            );
-            return true;
-        }
-
-        tracing::error!("所有凭据均已禁用！");
-        false
+        self.save_stats();
+        result
     }
 
     /// 切换到优先级最高的可用凭据
@@ -1032,6 +1181,8 @@ impl MultiTokenManager {
                     }),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
+                    success_count: e.success_count,
+                    last_used_at: e.last_used_at.clone(),
                 })
                 .collect(),
             current_id,
@@ -1212,6 +1363,8 @@ impl MultiTokenManager {
                 failure_count: 0,
                 disabled: false,
                 disabled_reason: None,
+                success_count: 0,
+                last_used_at: None,
             });
         }
 
@@ -1282,6 +1435,23 @@ impl MultiTokenManager {
         self.persist_credentials()?;
 
         tracing::info!("已删除凭据 #{}", id);
+        Ok(())
+    }
+
+    /// 获取负载均衡模式（Admin API）
+    pub fn get_load_balancing_mode(&self) -> String {
+        self.load_balancing_mode.lock().clone()
+    }
+
+    /// 设置负载均衡模式（Admin API）
+    pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
+        // 验证模式值
+        if mode != "priority" && mode != "balanced" {
+            anyhow::bail!("无效的负载均衡模式: {}", mode);
+        }
+
+        *self.load_balancing_mode.lock() = mode.clone();
+        tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
     }
 }

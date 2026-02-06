@@ -8,7 +8,7 @@ use axum::{
 
 use super::{
     middleware::AdminState,
-    types::{AddCredentialRequest, SetDisabledRequest, SetPriorityRequest, SuccessResponse},
+    types::{AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse},
 };
 
 /// GET /api/admin/credentials
@@ -99,6 +99,25 @@ pub async fn delete_credential(
 ) -> impl IntoResponse {
     match state.service.delete_credential(id) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/load-balancing
+/// 获取负载均衡模式
+pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_load_balancing_mode();
+    Json(response)
+}
+
+/// PUT /api/admin/config/load-balancing
+/// 设置负载均衡模式
+pub async fn set_load_balancing_mode(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetLoadBalancingModeRequest>,
+) -> impl IntoResponse {
+    match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

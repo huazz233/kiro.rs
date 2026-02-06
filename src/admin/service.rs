@@ -1,6 +1,12 @@
 //! Admin API 业务逻辑服务
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use chrono::Utc;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -8,19 +14,43 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse,
+    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
 };
+
+/// Balance cache TTL in seconds (5 minutes)
+const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// Cached balance entry with timestamp
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedBalance {
+    /// Cache timestamp (Unix seconds)
+    cached_at: f64,
+    /// Cached balance data
+    data: BalanceResponse,
+}
 
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    cache_path: Option<PathBuf>,
 }
 
 impl AdminService {
     pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
-        Self { token_manager }
+        let cache_path = token_manager
+            .cache_dir()
+            .map(|d| d.join("kiro_balance_cache.json"));
+
+        let balance_cache = Self::load_balance_cache_from(&cache_path);
+
+        Self {
+            token_manager,
+            balance_cache: Mutex::new(balance_cache),
+            cache_path,
+        }
     }
 
     /// 获取所有凭据状态
@@ -39,6 +69,10 @@ impl AdminService {
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
+                refresh_token: None,
+                email: None,
+                success_count: entry.success_count,
+                last_used_at: entry.last_used_at.clone(),
             })
             .collect();
 
@@ -84,8 +118,41 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
-    /// 获取凭据余额
+    /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        // Check cache first
+        {
+            let cache = self.balance_cache.lock();
+            if let Some(cached) = cache.get(&id) {
+                let now = Utc::now().timestamp() as f64;
+                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                    tracing::debug!("凭据 #{} 余额命中缓存", id);
+                    return Ok(cached.data.clone());
+                }
+            }
+        }
+
+        // Cache miss or stale, fetch from upstream
+        let balance = self.fetch_balance(id).await?;
+
+        // Update cache
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                id,
+                CachedBalance {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: balance.clone(),
+                },
+            );
+        }
+        self.save_balance_cache();
+
+        Ok(balance)
+    }
+
+    /// 从上游获取余额（无缓存）
+    async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
@@ -130,6 +197,7 @@ impl AdminService {
             priority: req.priority,
             region: req.region,
             machine_id: req.machine_id,
+            email: None,
         };
 
         // 调用 token_manager 添加凭据
@@ -143,6 +211,7 @@ impl AdminService {
             success: true,
             message: format!("凭据添加成功，ID: {}", credential_id),
             credential_id,
+            email: None,
         })
     }
 
@@ -152,6 +221,93 @@ impl AdminService {
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))
     }
+
+    /// 获取负载均衡模式
+    pub fn get_load_balancing_mode(&self) -> LoadBalancingModeResponse {
+        LoadBalancingModeResponse {
+            mode: self.token_manager.get_load_balancing_mode(),
+        }
+    }
+
+    /// 设置负载均衡模式
+    pub fn set_load_balancing_mode(
+        &self,
+        req: SetLoadBalancingModeRequest,
+    ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
+        // 验证模式值
+        if req.mode != "priority" && req.mode != "balanced" {
+            return Err(AdminServiceError::InvalidCredential(
+                "mode 必须是 'priority' 或 'balanced'".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_load_balancing_mode(req.mode.clone())
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    // ============ Balance cache persistence ============
+
+    fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
+        let path = match cache_path {
+            Some(p) => p,
+            None => return HashMap::new(),
+        };
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+
+        // File uses string keys for JSON compatibility
+        let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("解析余额缓存失败，将忽略: {}", e);
+                return HashMap::new();
+            }
+        };
+
+        let now = Utc::now().timestamp() as f64;
+        map.into_iter()
+            .filter_map(|(k, v)| {
+                let id = k.parse::<u64>().ok()?;
+                // Discard entries older than TTL
+                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                    Some((id, v))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn save_balance_cache(&self) {
+        let path = match &self.cache_path {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Hold lock during serialize + write to prevent concurrent corruption
+        let cache = self.balance_cache.lock();
+        let map: HashMap<String, &CachedBalance> = cache
+            .iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+
+        match serde_json::to_string_pretty(&map) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    tracing::warn!("保存余额缓存失败: {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
+        }
+    }
+
+    // ============ Error classification ============
 
     /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
@@ -225,8 +381,6 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") {
-            AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
         }

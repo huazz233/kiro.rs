@@ -74,6 +74,10 @@ pub struct Config {
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
+
+    /// 负载均衡模式（"priority" 或 "balanced"）
+    #[serde(default = "default_load_balancing_mode")]
+    pub load_balancing_mode: String,
 }
 
 fn default_host() -> String {
@@ -109,6 +113,10 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
+fn default_load_balancing_mode() -> String {
+    "priority".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -128,6 +136,7 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            load_balancing_mode: default_load_balancing_mode(),
         }
     }
 }
