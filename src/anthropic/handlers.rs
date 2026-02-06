@@ -108,7 +108,7 @@ pub async fn get_models() -> impl IntoResponse {
             object: "model".to_string(),
             created: 1730419200,
             owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
+            display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
         },
