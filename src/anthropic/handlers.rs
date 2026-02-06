@@ -180,7 +180,7 @@ pub async fn post_messages(
     let thinking_enabled = payload
         .thinking
         .as_ref()
-        .map(|t| t.thinking_type == "enabled")
+        .map(|t| t.is_enabled())
         .unwrap_or(false);
 
     if payload.stream {
@@ -635,7 +635,7 @@ pub async fn post_messages_cc(
     let thinking_enabled = payload
         .thinking
         .as_ref()
-        .map(|t| t.thinking_type == "enabled")
+        .map(|t| t.is_enabled())
         .unwrap_or(false);
 
     if payload.stream {
