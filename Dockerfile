@@ -26,6 +26,10 @@ RUN if [ "$ENABLE_SENSITIVE_LOGS" = "true" ]; then \
 
 FROM alpine:3.21
 
+LABEL org.opencontainers.image.source=https://github.com/huazz233/kiro.rs
+LABEL org.opencontainers.image.description="Anthropic Claude API compatible proxy service"
+LABEL org.opencontainers.image.licenses=MIT
+
 RUN apk add --no-cache ca-certificates
 
 WORKDIR /app

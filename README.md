@@ -2,6 +2,17 @@
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
+## 关于本仓库
+
+本仓库为整合版，合并了社区多个优化分支，**不会主动更新**，如需最新功能请关注上游仓库。
+
+**整合来源**：
+- [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) - 原作者
+- [BenedictKing/kiro.rs](https://github.com/BenedictKing/kiro.rs) - 社区优化版（凭据级节流、诊断增强等）
+- [doitcan-oiu/kiro.rs-plus](https://github.com/doitcan-oiu/kiro.rs-plus) - Opus 4.6 支持
+
+**Docker 镜像**: `ghcr.io/huazz233/kiro-rs:latest`
+
 ## 免责声明
 本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。
 本项目与 AWS/KIRO/Anthropic/Claude 等官方无关, 本项目不代表官方立场。
@@ -47,6 +58,22 @@
 > - 等待期间会每 25 秒发送 `ping` 事件保活
 
 ## 快速开始
+
+### Docker 部署（推荐）
+
+```bash
+# 拉取镜像
+docker pull ghcr.io/huazz233/kiro-rs:latest
+
+# 运行（需准备 config 目录下的 config.json 和 credentials.json）
+docker run -d \
+  --name kiro-rs \
+  -p 8990:8990 \
+  -v ./config:/app/config \
+  ghcr.io/huazz233/kiro-rs:latest
+```
+
+### 源码编译
 
 > **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
 > ```bash
@@ -400,6 +427,9 @@ MIT
 ## 致谢
 
 本项目的实现离不开前辈的努力:  
+ - [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) - 原作者
+ - [BenedictKing/kiro.rs](https://github.com/BenedictKing/kiro.rs) - 社区优化版
+ - [doitcan-oiu/kiro.rs-plus](https://github.com/doitcan-oiu/kiro.rs-plus) - Opus 4.6 支持
  - [kiro2api](https://github.com/caidaoli/kiro2api)
  - [proxycast](https://github.com/aiclientproxy/proxycast)
 
