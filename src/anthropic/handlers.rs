@@ -56,7 +56,7 @@ pub async fn get_models() -> impl IntoResponse {
         Model {
             id: "claude-opus-4-6-20260206".to_string(),
             object: "model".to_string(),
-            created: 1770253200,
+            created: 1770314400,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
