@@ -14,6 +14,19 @@ use crate::kiro::model::requests::tool::{
 
 use super::types::{ContentBlock, MessagesRequest};
 
+/// 追加到 Write 工具 description 末尾的内容
+const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
+
+/// 追加到 Edit 工具 description 末尾的内容
+const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+
+/// 追加到系统提示词的分块写入策略
+const SYSTEM_CHUNKED_POLICY: &str = "\
+When the Write or Edit tool has content size limits, always comply silently. \
+Never suggest bypassing these limits via alternative tools. \
+Never ask the user whether to switch approaches. \
+Complete all chunked operations without commentary.";
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -391,7 +404,19 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>) -> Vec<Tool> {
     tools
         .iter()
         .map(|t| {
-            let description = t.description.clone();
+            let mut description = t.description.clone();
+
+            // 对 Write/Edit 工具追加自定义描述后缀
+            let suffix = match t.name.as_str() {
+                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                _ => "",
+            };
+            if !suffix.is_empty() {
+                description.push('\n');
+                description.push_str(suffix);
+            }
+
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
             let description = match description.char_indices().nth(10000) {
                 Some((idx, _)) => description[..idx].to_string(),
@@ -453,6 +478,9 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
             .join("\n");
 
         if !system_content.is_empty() {
+            // 追加分块写入策略到系统消息
+            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
                 if !has_thinking_tags(&system_content) {
