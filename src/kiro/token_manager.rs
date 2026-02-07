@@ -12,6 +12,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
@@ -484,10 +486,16 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 最近一次统计持久化时间（用于 debounce）
+    last_stats_save_at: Mutex<Option<Instant>>,
+    /// 统计数据是否有未落盘更新
+    stats_dirty: AtomicBool,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+/// 统计数据持久化防抖间隔
+const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
 /// API 调用上下文
 ///
@@ -586,6 +594,8 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            last_stats_save_at: Mutex::new(None),
+            stats_dirty: AtomicBool::new(false),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -966,6 +976,8 @@ impl MultiTokenManager {
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
+        *self.last_stats_save_at.lock() = Some(Instant::now());
+        self.stats_dirty.store(false, Ordering::Relaxed);
         tracing::info!("已从缓存加载 {} 条统计数据", stats.len());
     }
 
@@ -976,28 +988,49 @@ impl MultiTokenManager {
             None => return,
         };
 
-        // Hold lock during serialize + write to prevent concurrent corruption
-        let entries = self.entries.lock();
-        let stats: HashMap<String, StatsEntry> = entries
-            .iter()
-            .map(|e| {
-                (
-                    e.id.to_string(),
-                    StatsEntry {
-                        success_count: e.success_count,
-                        last_used_at: e.last_used_at.clone(),
-                    },
-                )
-            })
-            .collect();
+        let stats: HashMap<String, StatsEntry> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|e| {
+                    (
+                        e.id.to_string(),
+                        StatsEntry {
+                            success_count: e.success_count,
+                            last_used_at: e.last_used_at.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
                 if let Err(e) = std::fs::write(&path, json) {
                     tracing::warn!("保存统计缓存失败: {}", e);
+                } else {
+                    *self.last_stats_save_at.lock() = Some(Instant::now());
+                    self.stats_dirty.store(false, Ordering::Relaxed);
                 }
             }
             Err(e) => tracing::warn!("序列化统计数据失败: {}", e),
+        }
+    }
+
+    /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
+    fn save_stats_debounced(&self) {
+        self.stats_dirty.store(true, Ordering::Relaxed);
+
+        let should_flush = {
+            let last = *self.last_stats_save_at.lock();
+            match last {
+                Some(last_saved_at) => last_saved_at.elapsed() >= STATS_SAVE_DEBOUNCE,
+                None => true,
+            }
+        };
+
+        if should_flush {
+            self.save_stats();
         }
     }
 
@@ -1021,7 +1054,7 @@ impl MultiTokenManager {
                 );
             }
         }
-        self.save_stats();
+        self.save_stats_debounced();
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1076,7 +1109,7 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
-        self.save_stats();
+        self.save_stats_debounced();
         result
     }
 
@@ -1126,7 +1159,7 @@ impl MultiTokenManager {
                 false
             }
         };
-        self.save_stats();
+        self.save_stats_debounced();
         result
     }
 
@@ -1491,6 +1524,14 @@ impl MultiTokenManager {
         *self.load_balancing_mode.lock() = mode.clone();
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
+    }
+}
+
+impl Drop for MultiTokenManager {
+    fn drop(&mut self) {
+        if self.stats_dirty.load(Ordering::Relaxed) {
+            self.save_stats();
+        }
     }
 }
 

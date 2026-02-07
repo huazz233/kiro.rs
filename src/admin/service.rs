@@ -292,10 +292,8 @@ impl AdminService {
 
         // Hold lock during serialize + write to prevent concurrent corruption
         let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> = cache
-            .iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect();
+        let map: HashMap<String, &CachedBalance> =
+            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
 
         match serde_json::to_string_pretty(&map) {
             Ok(json) => {
