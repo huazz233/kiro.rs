@@ -741,12 +741,16 @@ impl StreamContext {
                     self.thinking_buffer =
                         self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
                 } else {
-                    // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta
-                    // 保留可能是部分标签的内容
+                    // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
+                    // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
+                    // find_real_thinking_end_tag 要求标签后有 `\n\n` 才返回 Some，
+                    // 因此保留区必须覆盖 `</thinking>\n\n` 的完整长度（13 字节），
+                    // 否则当 `</thinking>` 已在 buffer 但 `\n\n` 尚未到达时，
+                    // 标签的前几个字符会被错误地作为 thinking_delta 发出。
                     let target_len = self
                         .thinking_buffer
                         .len()
-                        .saturating_sub("</thinking>".len());
+                        .saturating_sub("</thinking>\n\n".len());
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -1669,6 +1673,116 @@ mod tests {
             full_text
         );
         assert_eq!(full_text, "你好");
+    }
+
+    /// 辅助函数：从事件列表中提取所有 thinking_delta 的拼接内容
+    fn collect_thinking_content(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "thinking_delta"
+            })
+            .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// 辅助函数：从事件列表中提取所有 text_delta 的拼接内容
+    fn collect_text_content(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .filter(|e| {
+                e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
+            })
+            .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
+            .collect()
+    }
+
+    #[test]
+    fn test_end_tag_newlines_split_across_events() {
+        // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
+        // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>\n"));
+        all.extend(ctx.process_assistant_response("\n"));
+        all.extend(ctx.process_assistant_response("你好"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+
+        let text = collect_text_content(&all);
+        assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
+    }
+
+    #[test]
+    fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
+        // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all.extend(ctx.process_assistant_response("\n\n你好"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+
+        let text = collect_text_content(&all);
+        assert_eq!(text, "你好", "text should be '你好', got: {:?}", text);
+    }
+
+    #[test]
+    fn test_start_tag_newline_split_across_events() {
+        // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("\n\n"));
+        all.extend(ctx.process_assistant_response("<thinking>"));
+        all.extend(ctx.process_assistant_response("\n"));
+        all.extend(ctx.process_assistant_response("abc</thinking>\n\ntext"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        assert_eq!(thinking, "abc", "thinking should be 'abc', got: {:?}", thinking);
+
+        let text = collect_text_content(&all);
+        assert_eq!(text, "text", "text should be 'text', got: {:?}", text);
+    }
+
+    #[test]
+    fn test_full_flow_maximally_split() {
+        // 极端拆分：每个关键边界都在不同 chunk
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        // \n\n<thinking>\n 拆成多段
+        all.extend(ctx.process_assistant_response("\n"));
+        all.extend(ctx.process_assistant_response("\n"));
+        all.extend(ctx.process_assistant_response("<thin"));
+        all.extend(ctx.process_assistant_response("king>"));
+        all.extend(ctx.process_assistant_response("\n"));
+        all.extend(ctx.process_assistant_response("hello"));
+        // </thinking>\n\n 拆成多段
+        all.extend(ctx.process_assistant_response("</thi"));
+        all.extend(ctx.process_assistant_response("nking>"));
+        all.extend(ctx.process_assistant_response("\n"));
+        all.extend(ctx.process_assistant_response("\n"));
+        all.extend(ctx.process_assistant_response("world"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        assert_eq!(thinking, "hello", "thinking should be 'hello', got: {:?}", thinking);
+
+        let text = collect_text_content(&all);
+        assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
     }
 
     #[test]
