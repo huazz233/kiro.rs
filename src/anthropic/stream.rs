@@ -282,6 +282,13 @@ impl SseStateManager {
         self.stop_reason = Some(reason.into());
     }
 
+    /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
+    fn has_non_thinking_blocks(&self) -> bool {
+        self.active_blocks
+            .values()
+            .any(|b| b.block_type != "thinking")
+    }
+
     /// 获取最终的 stop_reason
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
@@ -1026,6 +1033,15 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
+        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
+        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上）
+        if self.thinking_enabled
+            && self.thinking_block_index.is_some()
+            && !self.state_manager.has_non_thinking_blocks()
+        {
+            self.state_manager.set_stop_reason("max_tokens");
+        }
+
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
@@ -1651,5 +1667,74 @@ mod tests {
             full_text
         );
         assert_eq!(full_text, "你好");
+    }
+
+    #[test]
+    fn test_thinking_only_sets_max_tokens_stop_reason() {
+        // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "max_tokens",
+            "stop_reason should be max_tokens when only thinking is produced"
+        );
+    }
+
+    #[test]
+    fn test_thinking_with_text_keeps_end_turn_stop_reason() {
+        // thinking + text 的情况，stop_reason 应为 end_turn
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>\n\nHello"));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "end_turn",
+            "stop_reason should be end_turn when text is also produced"
+        );
+    }
+
+    #[test]
+    fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
+        // thinking + tool_use 的情况，stop_reason 应为 tool_use
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("<thinking>\nabc</thinking>"));
+        all_events.extend(ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "test_tool".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        }));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"], "tool_use",
+            "stop_reason should be tool_use when tool_use is present"
+        );
     }
 }
