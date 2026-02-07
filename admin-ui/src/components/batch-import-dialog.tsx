@@ -319,12 +319,12 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             </p>
           </div>
 
-          {importing && (
+          {(importing || results.length > 0) && (
             <>
               {/* 进度条 */}
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span>验活进度</span>
+                  <span>{importing ? '验活进度' : '验活完成'}</span>
                   <span>{progress.current} / {progress.total}</span>
                 </div>
                 <div className="w-full bg-secondary rounded-full h-2">
@@ -333,7 +333,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                     style={{ width: `${(progress.current / progress.total) * 100}%` }}
                   />
                 </div>
-                {currentProcessing && (
+                {importing && currentProcessing && (
                   <div className="text-xs text-muted-foreground">
                     {currentProcessing}
                   </div>
