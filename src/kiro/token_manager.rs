@@ -7,6 +7,7 @@ use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
@@ -99,6 +100,13 @@ pub(crate) fn is_token_expired(credentials: &KiroCredentials) -> bool {
 /// 检查 Token 是否即将过期（10分钟内）
 pub(crate) fn is_token_expiring_soon(credentials: &KiroCredentials) -> bool {
     is_token_expiring_within(credentials, 10).unwrap_or(false)
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let result = hasher.finalize();
+    format!("{:x}", result)
 }
 
 /// 验证 refreshToken 的基本有效性
@@ -435,6 +443,8 @@ pub struct CredentialEntrySnapshot {
     pub has_profile_arn: bool,
     /// Token 过期时间
     pub expires_at: Option<String>,
+    /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
+    pub refresh_token_hash: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -646,9 +656,7 @@ impl MultiTokenManager {
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| e.credentials.priority)?;
+                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
@@ -921,7 +929,9 @@ impl MultiTokenManager {
 
     /// 获取缓存目录（凭据文件所在目录）
     pub fn cache_dir(&self) -> Option<PathBuf> {
-        self.credentials_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        self.credentials_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     }
 
     /// 统计数据文件路径
@@ -1004,7 +1014,11 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
-                tracing::debug!("凭据 #{} API 调用成功（累计 {} 次）", id, entry.success_count);
+                tracing::debug!(
+                    "凭据 #{} API 调用成功（累计 {} 次）",
+                    id,
+                    entry.success_count
+                );
             }
         }
         self.save_stats();
@@ -1181,6 +1195,7 @@ impl MultiTokenManager {
                     }),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: e.credentials.expires_at.clone(),
+                    refresh_token_hash: e.credentials.refresh_token.as_deref().map(sha256_hex),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                 })
@@ -1318,10 +1333,11 @@ impl MultiTokenManager {
     ///
     /// # 流程
     /// 1. 验证凭据基本字段（refresh_token 不为空）
-    /// 2. 尝试刷新 Token 验证凭据有效性
-    /// 3. 分配新 ID（当前最大 ID + 1）
-    /// 4. 添加到 entries 列表
-    /// 5. 持久化到配置文件
+    /// 2. 基于 refreshToken 的 SHA-256 哈希检测重复
+    /// 3. 尝试刷新 Token 验证凭据有效性
+    /// 4. 分配新 ID（当前最大 ID + 1）
+    /// 5. 添加到 entries 列表
+    /// 6. 持久化到配置文件
     ///
     /// # 返回
     /// - `Ok(u64)` - 新凭据 ID
@@ -1330,17 +1346,39 @@ impl MultiTokenManager {
         // 1. 基本验证
         validate_refresh_token(&new_cred)?;
 
-        // 2. 尝试刷新 Token 验证凭据有效性
+        // 2. 基于 refreshToken 的 SHA-256 哈希检测重复
+        let new_refresh_token = new_cred
+            .refresh_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
+        let new_refresh_token_hash = sha256_hex(new_refresh_token);
+        let duplicate_exists = {
+            let entries = self.entries.lock();
+            entries.iter().any(|entry| {
+                entry
+                    .credentials
+                    .refresh_token
+                    .as_deref()
+                    .map(sha256_hex)
+                    .as_deref()
+                    == Some(new_refresh_token_hash.as_str())
+            })
+        };
+        if duplicate_exists {
+            anyhow::bail!("凭据已存在（refreshToken 重复）");
+        }
+
+        // 3. 尝试刷新 Token 验证凭据有效性
         let mut validated_cred =
             refresh_token(&new_cred, &self.config, self.proxy.as_ref()).await?;
 
-        // 3. 分配新 ID
+        // 4. 分配新 ID
         let new_id = {
             let entries = self.entries.lock();
             entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
         };
 
-        // 4. 设置 ID 并保留用户输入的元数据
+        // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
         validated_cred.priority = new_cred.priority;
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
@@ -1368,7 +1406,7 @@ impl MultiTokenManager {
             });
         }
 
-        // 5. 持久化
+        // 6. 持久化
         self.persist_credentials()?;
 
         tracing::info!("成功添加凭据 #{}", new_id);
@@ -1526,6 +1564,32 @@ mod tests {
         credentials.refresh_token = Some("a".repeat(150));
         let result = validate_refresh_token(&credentials);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sha256_hex() {
+        let result = sha256_hex("test");
+        assert_eq!(
+            result,
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_reject_duplicate_refresh_token() {
+        let config = Config::default();
+
+        let mut existing = KiroCredentials::default();
+        existing.refresh_token = Some("a".repeat(150));
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+
+        let mut duplicate = KiroCredentials::default();
+        duplicate.refresh_token = Some("a".repeat(150));
+
+        let result = manager.add_credential(duplicate).await;
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("凭据已存在"));
     }
 
     // MultiTokenManager 测试

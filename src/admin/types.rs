@@ -38,8 +38,8 @@ pub struct CredentialStatusItem {
     pub auth_method: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
-    /// 刷新令牌（用于前端重复检测）
-    pub refresh_token: Option<String>,
+    /// refreshToken 的 SHA-256 哈希（用于前端重复检测）
+    pub refresh_token_hash: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
     /// API 调用成功次数

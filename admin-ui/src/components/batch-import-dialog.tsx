@@ -35,6 +35,13 @@ interface VerificationResult {
   credentialId?: number
 }
 
+async function sha256Hex(value: string): Promise<string> {
+  const encoded = new TextEncoder().encode(value)
+  const digest = await crypto.subtle.digest('SHA-256', encoded)
+  const bytes = new Uint8Array(digest)
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
@@ -75,8 +82,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       setResults(initialResults)
 
       // 3. 检测重复
-      const existingTokens = new Set(
-        existingCredentials?.credentials.map(c => c.refreshToken) || []
+      const existingTokenHashes = new Set(
+        existingCredentials?.credentials
+          .map(c => c.refreshTokenHash)
+          .filter((hash): hash is string => Boolean(hash)) || []
       )
 
       let successCount = 0
@@ -87,6 +96,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       for (let i = 0; i < credentials.length; i++) {
         const cred = credentials[i]
         const token = cred.refreshToken.trim()
+        const tokenHash = await sha256Hex(token)
 
         // 更新状态为检查中
         setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
@@ -97,9 +107,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         })
 
         // 检查重复
-        if (existingTokens.has(token)) {
+        if (existingTokenHashes.has(tokenHash)) {
           duplicateCount++
-          const existingCred = existingCredentials?.credentials.find(c => c.refreshToken === token)
+          const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
           setResults(prev => {
             const newResults = [...prev]
             newResults[i] = {
@@ -145,6 +155,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           // 验活成功
           successCount++
+          existingTokenHashes.add(tokenHash)
           setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]

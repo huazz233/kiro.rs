@@ -17,7 +17,7 @@ export interface CredentialStatusItem {
   authMethod: string | null
   hasProfileArn: boolean
   email?: string
-  refreshToken?: string
+  refreshTokenHash?: string
   successCount: number
   lastUsedAt: string | null
 }

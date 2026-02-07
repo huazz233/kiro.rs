@@ -1043,8 +1043,13 @@ pub struct BufferedStreamContext {
 
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
-    pub fn new(model: impl Into<String>, estimated_input_tokens: i32, thinking_enabled: bool) -> Self {
-        let inner = StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled);
+    pub fn new(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+    ) -> Self {
+        let inner =
+            StreamContext::new_with_thinking(model, estimated_input_tokens, thinking_enabled);
         Self {
             inner,
             event_buffer: Vec::new(),

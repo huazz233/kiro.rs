@@ -69,7 +69,7 @@ impl AdminService {
                 expires_at: entry.expires_at,
                 auth_method: entry.auth_method,
                 has_profile_arn: entry.has_profile_arn,
-                refresh_token: None,
+                refresh_token_hash: entry.refresh_token_hash,
                 email: None,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
@@ -360,6 +360,8 @@ impl AdminService {
         let is_invalid_credential = msg.contains("缺少 refreshToken")
             || msg.contains("refreshToken 为空")
             || msg.contains("refreshToken 已被截断")
+            || msg.contains("凭据已存在")
+            || msg.contains("refreshToken 重复")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");

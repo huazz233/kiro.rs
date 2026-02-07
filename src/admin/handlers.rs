@@ -8,7 +8,10 @@ use axum::{
 
 use super::{
     middleware::AdminState,
-    types::{AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse},
+    types::{
+        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SuccessResponse,
+    },
 };
 
 /// GET /api/admin/credentials

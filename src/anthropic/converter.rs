@@ -421,9 +421,7 @@ fn remove_orphaned_tool_uses(
 
     for msg in history.iter_mut() {
         if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) =
-                assistant_msg.assistant_response_message.tool_uses
-            {
+            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 let original_len = tool_uses.len();
                 tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
 
