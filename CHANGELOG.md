@@ -2,7 +2,32 @@
 
 ## [Unreleased]
 
+### Fixed
+- **[P0] API Key 日志泄露修复** (`src/main.rs`)
+  - info 级别不再打印 API Key 前半段，仅显示末 4 位和长度
+  - 完整前缀仅在 `sensitive-logs` feature 的 debug 级别输出
+- **[P2] 占位工具大小写变体重复插入** (`src/anthropic/converter.rs`)
+  - `collect_history_tool_names` 改为小写去重，避免 `read`/`Read` 等变体重复
+  - 占位工具 push 后同步更新 `existing_tool_names` 集合
+- **[P2] Assistant Prefill 静默丢弃** (`src/anthropic/converter.rs`, `src/anthropic/handlers.rs`)
+  - 末尾 `assistant` 消息（prefill 场景）不再返回 400 错误，改为静默丢弃并回退到最后一条 `user` 消息
+  - Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持，转换器在入口处截断消息列表
+  - 移除 `InvalidLastMessageRole` 错误变体，`build_history` 接受预处理后的消息切片
+- **[P2] 凭据回写原子性** (`src/kiro/token_manager.rs`)
+  - `persist_credentials` 改为临时文件 + `rename` 原子替换
+  - 新增 `resolve_symlink_target` 辅助函数：优先 `canonicalize`，失败时用 `read_link` 解析 symlink
+  - 保留原文件权限，防止 umask 导致凭据文件权限放宽
+  - Windows 兼容：`rename` 前先删除已存在的目标文件
+  - 避免进程崩溃或并发调用导致凭据文件损坏
+
 ### Changed
+- 重构 README.md 配置文档，提升新用户上手体验
+  - 明确配置文件默认路径：当前工作目录（或通过 `-c`/`--config` 和 `--credentials` 参数指定）
+  - 添加 JSON 注释警告：移除所有带 `//` 注释的示例，提供可直接复制的配置
+  - 修正字段必填性：仅 `apiKey` 为必填，其他字段均有默认值
+  - 新增命令行参数说明表格（`-c`, `--credentials`, `-h`, `-V`）
+  - 补充遗漏的 `credentialRpm` 字段说明（凭据级 RPM 限流）
+  - 使用表格形式展示配置字段，标注必填/可选和默认值
 - 优化 debug 日志中请求体的输出长度 (`src/anthropic/handlers.rs`)
   - 新增 `truncate_middle()` 函数：截断字符串中间部分，保留头尾各 1200 字符
   - 正确处理 UTF-8 多字节字符边界，不会截断中文

@@ -12,7 +12,20 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool as KiroTool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, MessagesRequest, Thinking, Tool as AnthropicTool};
+use super::types::{ContentBlock, MessagesRequest, Tool as AnthropicTool};
+
+/// 追加到 Write 工具 description 末尾的内容
+const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
+
+/// 追加到 Edit 工具 description 末尾的内容
+const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+
+/// 追加到系统提示词的分块写入策略
+const SYSTEM_CHUNKED_POLICY: &str = "\
+When the Write or Edit tool has content size limits, always comply silently. \
+Never suggest bypassing these limits via alternative tools. \
+Never ask the user whether to switch approaches. \
+Complete all chunked operations without commentary.";
 
 fn non_empty_content_or_space(content: String, has_non_text_payload: bool) -> String {
     // Kiro 上游在部分场景下会拒绝空 content（例如仅 tool_result / 仅 image 的消息）。
@@ -49,10 +62,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         .filter(|v| !v.trim().is_empty())
         .unwrap_or("http://json-schema.org/draft-07/schema#")
         .to_string();
-    obj.insert(
-        "$schema".to_string(),
-        serde_json::Value::String(schema_uri),
-    );
+    obj.insert("$schema".to_string(), serde_json::Value::String(schema_uri));
 
     // type
     let ty = obj
@@ -94,9 +104,9 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
-/// 按照用户要求：
+/// 映射规则：
 /// - 所有 sonnet → claude-sonnet-4.5
-/// - 所有 opus → claude-opus-4.5
+/// - opus 且显式包含 4.5/4-5 → claude-opus-4.5，否则 → claude-opus-4.6（默认最新版）
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
@@ -104,7 +114,11 @@ pub fn map_model(model: &str) -> Option<String> {
     if model_lower.contains("sonnet") {
         Some("claude-sonnet-4.5".to_string())
     } else if model_lower.contains("opus") {
-        Some("claude-opus-4.5".to_string())
+        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+            Some("claude-opus-4.5".to_string())
+        } else {
+            Some("claude-opus-4.6".to_string())
+        }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
     } else {
@@ -158,8 +172,12 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     None
 }
 
-/// 收集历史消息中使用的所有工具名称
+/// 收集历史消息中使用的所有工具名称（小写去重）
+///
+/// 返回去重后的工具名称列表，保留原始大小写（首次出现的形式），
+/// 但通过小写比较避免 `read` / `Read` 这类变体重复。
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
+    let mut seen_lowercase = std::collections::HashSet::new();
     let mut tool_names = Vec::new();
 
     for msg in history {
@@ -167,7 +185,7 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
             && let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses
         {
             for tool_use in tool_uses {
-                if !tool_names.contains(&tool_use.name) {
+                if seen_lowercase.insert(tool_use.name.to_lowercase()) {
                     tool_names.push(tool_use.name.clone());
                 }
             }
@@ -206,6 +224,25 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         return Err(ConversionError::EmptyMessages);
     }
 
+    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
+    // 原因：Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
+    let messages: &[_] = if req
+        .messages
+        .last()
+        .map(|m| m.role != "user")
+        .unwrap_or(false)
+    {
+        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃，回退到最后一条 user 消息");
+        let last_user_idx = req
+            .messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .ok_or(ConversionError::EmptyMessages)?;
+        &req.messages[..=last_user_idx]
+    } else {
+        &req.messages
+    };
+
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
     let conversation_id = req
@@ -219,15 +256,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message
-    let last_message = req.messages.last().unwrap();
+    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
+    let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
 
     // 6. 转换工具定义
     let mut tools = convert_tools(&req.tools);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, &model_id)?;
+    let mut history = build_history(req, messages, &model_id)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
@@ -242,14 +279,16 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
-    let existing_tool_names: std::collections::HashSet<_> = tools
+    let mut existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
 
     for tool_name in history_tool_names {
-        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+        let lower = tool_name.to_lowercase();
+        if !existing_tool_names.contains(&lower) {
             tools.push(create_placeholder_tool(&tool_name));
+            existing_tool_names.insert(lower);
         }
     }
 
@@ -532,11 +571,23 @@ fn convert_tools(tools: &Option<Vec<AnthropicTool>>) -> Vec<KiroTool> {
             !dominated
         })
         .map(|t| {
-            let description = if t.description.trim().is_empty() {
+            let mut description = if t.description.trim().is_empty() {
                 format!("Tool: {}", t.name)
             } else {
                 t.description.clone()
             };
+
+            // 对 Write/Edit 工具追加自定义描述后缀
+            let suffix = match t.name.as_str() {
+                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                _ => "",
+            };
+            if !suffix.is_empty() {
+                description.push('\n');
+                description.push_str(suffix);
+            }
+
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
             let description = match description.char_indices().nth(10000) {
                 Some((idx, _)) => description[..idx].to_string(),
@@ -557,14 +608,32 @@ fn convert_tools(tools: &Option<Vec<AnthropicTool>>) -> Vec<KiroTool> {
 }
 
 /// 生成thinking标签前缀
-fn generate_thinking_prefix(thinking: &Option<Thinking>) -> Option<String> {
-    if let Some(t) = thinking
-        && t.thinking_type == "enabled"
-    {
-        return Some(format!(
-            "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-            t.budget_tokens
-        ));
+fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
+    if let Some(t) = &req.thinking {
+        if t.thinking_type == "enabled" {
+            return Some(format!(
+                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
+                t.budget_tokens
+            ));
+        } else if t.thinking_type == "adaptive" {
+            let raw_effort = req
+                .output_config
+                .as_ref()
+                .map(|c| c.effort.as_str())
+                .unwrap_or("high");
+            // 白名单归一化：仅接受 low/medium/high，非法值回退 high
+            let effort = match raw_effort {
+                "low" | "medium" | "high" => raw_effort,
+                _ => {
+                    tracing::warn!("未知的 thinking effort 值 '{}', 回退为 'high'", raw_effort);
+                    "high"
+                }
+            };
+            return Some(format!(
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
+                effort
+            ));
+        }
     }
     None
 }
@@ -574,12 +643,27 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+/// 检查请求的工具列表中是否包含 Write 或 Edit 工具
+fn has_write_or_edit_tool(req: &MessagesRequest) -> bool {
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.name == "Write" || t.name == "Edit"))
+}
+
 /// 构建历史消息
-fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, ConversionError> {
+/// `messages` 参数是经过 prefill 预处理后的消息切片（末尾必为 user）
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(&req.thinking);
+    let thinking_prefix = generate_thinking_prefix(req);
+
+    // 仅在请求包含 Write/Edit 工具时注入分块写入策略
+    let should_inject_chunked_policy = has_write_or_edit_tool(req);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -590,6 +674,13 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
             .join("\n");
 
         if !system_content.is_empty() {
+            // 仅在存在 Write/Edit 工具时追加分块写入策略到系统消息
+            let system_content = if should_inject_chunked_policy {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
+
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
                 if !has_thinking_tags(&system_content) {
@@ -608,9 +699,18 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
             history.push(Message::Assistant(assistant_msg));
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
+    } else if thinking_prefix.is_some() || should_inject_chunked_policy {
+        // 没有系统消息但需要注入 thinking 配置或分块写入策略
+        let mut parts = Vec::new();
+        if let Some(ref prefix) = thinking_prefix {
+            parts.push(prefix.clone());
+        }
+        if should_inject_chunked_policy {
+            parts.push(SYSTEM_CHUNKED_POLICY.to_string());
+        }
+        let content = parts.join("\n");
+
+        let user_msg = HistoryUserMessage::new(content, model_id);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
@@ -619,27 +719,12 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
 
     // 2. 处理常规消息历史
     // 最后一条消息作为 currentMessage，不加入历史
-    let history_end_index = req.messages.len().saturating_sub(1);
-
-    // 如果最后一条是 assistant，则包含在历史中
-    let last_is_assistant = req
-        .messages
-        .last()
-        .map(|m| m.role == "assistant")
-        .unwrap_or(false);
-
-    let history_end_index = if last_is_assistant {
-        req.messages.len()
-    } else {
-        history_end_index
-    };
+    let history_end_index = messages.len().saturating_sub(1);
 
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
 
-    for i in 0..history_end_index {
-        let msg = &req.messages[i];
-
+    for msg in messages.iter().take(history_end_index) {
         if msg.role == "user" {
             user_buffer.push(msg);
         } else if msg.role == "assistant" {
@@ -797,11 +882,21 @@ mod tests {
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
+        // 不含 4.5/4-5 的 opus → 默认映射到最新版 4.6
+        assert_eq!(
+            map_model("claude-opus-4-20250514").unwrap(),
+            "claude-opus-4.6"
         );
+        assert_eq!(
+            map_model("claude-opus-4-20260206").unwrap(),
+            "claude-opus-4.6"
+        );
+        // 显式 4.5 → 保留 4.5
+        assert_eq!(
+            map_model("claude-opus-4-5-20250514").unwrap(),
+            "claude-opus-4.5"
+        );
+        assert_eq!(map_model("claude-opus-4.5").unwrap(), "claude-opus-4.5");
     }
 
     #[test]
@@ -830,6 +925,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
@@ -908,6 +1004,7 @@ mod tests {
             tools: None, // 没有提供工具定义
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -972,6 +1069,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
@@ -1003,6 +1101,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1380,6 +1479,7 @@ mod tests {
             }]),
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1438,6 +1538,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1494,6 +1595,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1607,7 +1709,10 @@ mod tests {
             normalized.get("$schema").and_then(|v| v.as_str()),
             Some("http://json-schema.org/draft-07/schema#")
         );
-        assert_eq!(normalized.get("type").and_then(|v| v.as_str()), Some("object"));
+        assert_eq!(
+            normalized.get("type").and_then(|v| v.as_str()),
+            Some("object")
+        );
         assert!(normalized.get("properties").is_some_and(|v| v.is_object()));
         assert!(normalized.get("required").is_some_and(|v| v.is_array()));
         assert!(
@@ -1632,5 +1737,277 @@ mod tests {
             .expect("required 应该是数组");
 
         assert_eq!(required, &vec![serde_json::Value::String("a".to_string())]);
+    }
+
+    #[test]
+    fn test_chunked_policy_injected_only_with_write_edit_tools() {
+        use super::super::types::{
+            Message as AnthropicMessage, SystemMessage, Tool as AnthropicTool,
+        };
+        use std::collections::HashMap;
+
+        let system = vec![SystemMessage {
+            text: "You are a helpful assistant.".to_string(),
+        }];
+
+        // 无工具 → 不注入 chunked policy
+        let req_no_tools = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(system.clone()),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req_no_tools).unwrap();
+        let first_user = &result.conversation_state.history[0];
+        match first_user {
+            Message::User(u) => {
+                assert!(
+                    !u.user_input_message.content.contains("chunked operations"),
+                    "无工具时不应注入 chunked policy"
+                );
+            }
+            _ => panic!("history[0] 应该是 User 消息"),
+        }
+
+        // 有 Write 工具 → 注入 chunked policy
+        let req_with_write = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(system.clone()),
+            tools: Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "Write".to_string(),
+                description: "Write a file".to_string(),
+                input_schema: HashMap::new(),
+                max_uses: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req_with_write).unwrap();
+        let first_user = &result.conversation_state.history[0];
+        match first_user {
+            Message::User(u) => {
+                assert!(
+                    u.user_input_message.content.contains("chunked operations"),
+                    "有 Write 工具时应注入 chunked policy"
+                );
+            }
+            _ => panic!("history[0] 应该是 User 消息"),
+        }
+
+        // system: None + 有 Edit 工具 → 也应注入 chunked policy
+        let req_no_system_with_edit = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "Edit".to_string(),
+                description: "Edit a file".to_string(),
+                input_schema: HashMap::new(),
+                max_uses: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req_no_system_with_edit).unwrap();
+        let first_user = &result.conversation_state.history[0];
+        match first_user {
+            Message::User(u) => {
+                assert!(
+                    u.user_input_message.content.contains("chunked operations"),
+                    "system: None + 有 Edit 工具时也应注入 chunked policy"
+                );
+            }
+            _ => panic!("history[0] 应该是 User 消息"),
+        }
+    }
+
+    #[test]
+    fn test_effort_whitelist_fallback() {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        // 合法值 "low"
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "low".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_effort>low</thinking_effort>"));
+
+        // 非法值 → 回退 "high"
+        let req_invalid = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "ultra".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let prefix = generate_thinking_prefix(&req_invalid).unwrap();
+        assert!(
+            prefix.contains("<thinking_effort>high</thinking_effort>"),
+            "非法 effort 值应回退为 high，实际: {}",
+            prefix
+        );
+    }
+
+    #[test]
+    fn test_collect_history_tool_names_deduplicates_case_variants() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        // 历史中同时出现 "read" 和 "Read"（大小写变体），应只保留首次出现的形式
+        let mut msg1 = AssistantMessage::new("reading...");
+        msg1 = msg1.with_tool_uses(vec![
+            ToolUseEntry::new("t-1", "read").with_input(serde_json::json!({"path": "/a.txt"})),
+        ]);
+
+        let mut msg2 = AssistantMessage::new("reading again...");
+        msg2 = msg2.with_tool_uses(vec![
+            ToolUseEntry::new("t-2", "Read").with_input(serde_json::json!({"path": "/b.txt"})),
+        ]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new("go", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: msg1,
+            }),
+            Message::User(HistoryUserMessage::new("ok", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: msg2,
+            }),
+        ];
+
+        let tool_names = collect_history_tool_names(&history);
+        // 只应有 1 个条目（首次出现的 "read"）
+        assert_eq!(
+            tool_names.len(),
+            1,
+            "大小写变体应被去重，实际: {:?}",
+            tool_names
+        );
+        assert_eq!(tool_names[0], "read");
+    }
+
+    #[test]
+    fn test_convert_request_handles_assistant_prefill() {
+        // 末尾 assistant 消息（prefill）应被静默丢弃，使用最后一条 user 消息作为 current_message
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Hello"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("Hi there"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req);
+        assert!(result.is_ok(), "prefill 场景不应报错: {:?}", result.err());
+        let state = result.unwrap().conversation_state;
+        assert_eq!(
+            state.current_message.user_input_message.content, "Hello",
+            "current_message 应为最后一条 user 消息的内容"
+        );
+    }
+
+    #[test]
+    fn test_convert_request_prefill_no_user_message() {
+        // 只有 assistant 消息、没有 user 消息时应返回 EmptyMessages 错误
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Hi there"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let err = convert_request(&req).unwrap_err();
+        assert!(
+            matches!(err, ConversionError::EmptyMessages),
+            "只有 assistant 消息时应返回 EmptyMessages，实际: {:?}",
+            err
+        );
     }
 }

@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -68,7 +68,6 @@ fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Respon
 }
 
 /// 对 user_id 进行掩码处理，保护隐私
-
 fn mask_user_id(user_id: Option<&str>) -> String {
     match user_id {
         Some(id) if id.len() > 25 => format!("{}***{}", &id[..13], &id[id.len() - 8..]),
@@ -100,6 +99,15 @@ pub async fn get_models() -> impl IntoResponse {
             created: 1730419200,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+        },
+        Model {
+            id: "claude-opus-4-6-20260206".to_string(),
+            object: "model".to_string(),
+            created: 1770314400,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.6".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
         },
@@ -224,7 +232,10 @@ pub async fn post_messages(
     };
 
     #[cfg(feature = "sensitive-logs")]
-    tracing::debug!("Kiro request body: {}", truncate_middle(&request_body, 1200));
+    tracing::debug!(
+        "Kiro request body: {}",
+        truncate_middle(&request_body, 1200)
+    );
     #[cfg(not(feature = "sensitive-logs"))]
     tracing::debug!(
         kiro_request_body_bytes = request_body.len(),
@@ -243,7 +254,7 @@ pub async fn post_messages(
     let thinking_enabled = payload
         .thinking
         .as_ref()
-        .map(|t| t.thinking_type == "enabled")
+        .map(|t| t.is_enabled())
         .unwrap_or(false);
 
     if payload.stream {
@@ -693,7 +704,10 @@ pub async fn post_messages_cc(
     };
 
     #[cfg(feature = "sensitive-logs")]
-    tracing::debug!("Kiro request body: {}", truncate_middle(&request_body, 1200));
+    tracing::debug!(
+        "Kiro request body: {}",
+        truncate_middle(&request_body, 1200)
+    );
     #[cfg(not(feature = "sensitive-logs"))]
     tracing::debug!(
         kiro_request_body_bytes = request_body.len(),
@@ -712,7 +726,7 @@ pub async fn post_messages_cc(
     let thinking_enabled = payload
         .thinking
         .as_ref()
-        .map(|t| t.thinking_type == "enabled")
+        .map(|t| t.is_enabled())
         .unwrap_or(false);
 
     if payload.stream {
