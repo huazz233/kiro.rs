@@ -1518,6 +1518,27 @@ impl MultiTokenManager {
         self.load_balancing_mode.lock().clone()
     }
 
+    fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.load_balancing_mode = mode.to_string();
+        config
+            .save()
+            .with_context(|| format!("持久化负载均衡模式失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
@@ -1525,7 +1546,18 @@ impl MultiTokenManager {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
+        let previous_mode = self.get_load_balancing_mode();
+        if previous_mode == mode {
+            return Ok(());
+        }
+
         *self.load_balancing_mode.lock() = mode.clone();
+
+        if let Err(err) = self.persist_load_balancing_mode(&mode) {
+            *self.load_balancing_mode.lock() = previous_mode;
+            return Err(err);
+        }
+
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
     }
@@ -1751,6 +1783,35 @@ mod tests {
             manager.credentials().refresh_token,
             Some("token2".to_string())
         );
+    }
+
+    #[test]
+    fn test_set_load_balancing_mode_persists_to_config_file() {
+        let config_path = std::env::temp_dir().join(format!(
+            "kiro-load-balancing-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager
+            .set_load_balancing_mode("balanced".to_string())
+            .unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "balanced");
+        assert_eq!(manager.get_load_balancing_mode(), "balanced");
+
+        std::fs::remove_file(&config_path).unwrap();
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -78,6 +79,10 @@ pub struct Config {
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    /// 配置文件路径（运行时元数据，不写入 JSON）
+    #[serde(skip)]
+    config_path: Option<PathBuf>,
 }
 
 fn default_host() -> String {
@@ -137,6 +142,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            config_path: None,
         }
     }
 }
@@ -152,11 +158,31 @@ impl Config {
         let path = path.as_ref();
         if !path.exists() {
             // 配置文件不存在，返回默认配置
-            return Ok(Self::default());
+            let mut config = Self::default();
+            config.config_path = Some(path.to_path_buf());
+            return Ok(config);
         }
 
         let content = fs::read_to_string(path)?;
-        let config: Config = serde_json::from_str(&content)?;
+        let mut config: Config = serde_json::from_str(&content)?;
+        config.config_path = Some(path.to_path_buf());
         Ok(config)
+    }
+
+    /// 获取配置文件路径（如果有）
+    pub fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
+    }
+
+    /// 将当前配置写回原始配置文件
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = self
+            .config_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
+
+        let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
+        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        Ok(())
     }
 }
