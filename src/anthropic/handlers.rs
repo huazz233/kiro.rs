@@ -200,10 +200,6 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidLastMessageRole(role) => (
-                    "invalid_request_error",
-                    format!("最后一条消息角色必须为 user，实际为: {}", role),
-                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
@@ -676,10 +672,6 @@ pub async fn post_messages_cc(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::InvalidLastMessageRole(role) => (
-                    "invalid_request_error",
-                    format!("最后一条消息角色必须为 user，实际为: {}", role),
-                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (

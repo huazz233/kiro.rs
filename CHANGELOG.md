@@ -9,9 +9,10 @@
 - **[P2] 占位工具大小写变体重复插入** (`src/anthropic/converter.rs`)
   - `collect_history_tool_names` 改为小写去重，避免 `read`/`Read` 等变体重复
   - 占位工具 push 后同步更新 `existing_tool_names` 集合
-- **[P2] 最后一条消息角色校验** (`src/anthropic/converter.rs`, `src/anthropic/handlers.rs`)
-  - `convert_request` 显式校验最后一条消息 role 必须为 `user`
-  - 新增 `InvalidLastMessageRole` 错误变体，映射为 400 响应
+- **[P2] Assistant Prefill 静默丢弃** (`src/anthropic/converter.rs`, `src/anthropic/handlers.rs`)
+  - 末尾 `assistant` 消息（prefill 场景）不再返回 400 错误，改为静默丢弃并回退到最后一条 `user` 消息
+  - Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持，转换器在入口处截断消息列表
+  - 移除 `InvalidLastMessageRole` 错误变体，`build_history` 接受预处理后的消息切片
 - **[P2] 凭据回写原子性** (`src/kiro/token_manager.rs`)
   - `persist_credentials` 改为临时文件 + `rename` 原子替换
   - 新增 `resolve_symlink_target` 辅助函数：优先 `canonicalize`，失败时用 `read_link` 解析 symlink
