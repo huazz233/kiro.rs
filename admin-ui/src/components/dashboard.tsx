@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -29,7 +29,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
-  const [cancelVerify, setCancelVerify] = useState(false)
+  const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
@@ -234,9 +234,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     // 初始化状态
     setVerifying(true)
-    setCancelVerify(false)
+    cancelVerifyRef.current = false
     const ids = Array.from(selectedIds)
     setVerifyProgress({ current: 0, total: ids.length })
+
+    let successCount = 0
 
     // 初始化结果，所有凭据状态为 pending
     const initialResults = new Map<number, VerifyResult>()
@@ -249,7 +251,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     // 开始验活
     for (let i = 0; i < ids.length; i++) {
       // 检查是否取消
-      if (cancelVerify) {
+      if (cancelVerifyRef.current) {
         toast.info('已取消验活')
         break
       }
@@ -265,6 +267,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       try {
         const balance = await getCredentialBalance(id)
+        successCount++
 
         // 更新为成功状态
         setVerifyResults(prev => {
@@ -293,23 +296,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
       setVerifyProgress({ current: i + 1, total: ids.length })
 
       // 添加延迟防止封号（最后一个不需要延迟）
-      if (i < ids.length - 1 && !cancelVerify) {
+      if (i < ids.length - 1 && !cancelVerifyRef.current) {
         await new Promise(resolve => setTimeout(resolve, 2000))
       }
     }
 
     setVerifying(false)
 
-    if (!cancelVerify) {
-      const results = Array.from(verifyResults.values())
-      const successCount = results.filter(r => r.status === 'success').length
+    if (!cancelVerifyRef.current) {
       toast.success(`验活完成：成功 ${successCount}/${ids.length}`)
     }
   }
 
   // 取消验活
   const handleCancelVerify = () => {
-    setCancelVerify(true)
+    cancelVerifyRef.current = true
     setVerifying(false)
   }
 
