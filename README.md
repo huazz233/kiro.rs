@@ -4,12 +4,9 @@
 
 ## 关于本仓库
 
-本仓库为整合版，合并了社区多个优化分支，**不会主动更新**，如需最新功能请关注上游仓库。
-
-**整合来源**：
+本仓库仅用于构建 Docker 镜像，如需最新功能请关注上游仓库：
 - [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) - 原作者
-- [BenedictKing/kiro.rs](https://github.com/BenedictKing/kiro.rs) - 社区优化版（凭据级节流、诊断增强等）
-- [doitcan-oiu/kiro.rs-plus](https://github.com/doitcan-oiu/kiro.rs-plus) - Opus 4.6 支持
+- [BenedictKing/kiro.rs](https://github.com/BenedictKing/kiro.rs) - 社区优化版
 
 **Docker 镜像**: `ghcr.io/huazz233/kiro-rs:latest`
 
@@ -471,7 +468,6 @@ MIT
 本项目的实现离不开前辈的努力:  
  - [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) - 原作者
  - [BenedictKing/kiro.rs](https://github.com/BenedictKing/kiro.rs) - 社区优化版
- - [doitcan-oiu/kiro.rs-plus](https://github.com/doitcan-oiu/kiro.rs-plus) - Opus 4.6 支持
  - [kiro2api](https://github.com/caidaoli/kiro2api)
  - [proxycast](https://github.com/aiclientproxy/proxycast)
 
