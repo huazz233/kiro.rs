@@ -677,9 +677,18 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
             history.push(Message::Assistant(assistant_msg));
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
+    } else if thinking_prefix.is_some() || should_inject_chunked_policy {
+        // 没有系统消息但需要注入 thinking 配置或分块写入策略
+        let mut parts = Vec::new();
+        if let Some(ref prefix) = thinking_prefix {
+            parts.push(prefix.clone());
+        }
+        if should_inject_chunked_policy {
+            parts.push(SYSTEM_CHUNKED_POLICY.to_string());
+        }
+        let content = parts.join("\n");
+
+        let user_msg = HistoryUserMessage::new(content, model_id);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
@@ -1751,11 +1760,14 @@ mod tests {
 
         let result = convert_request(&req_no_tools).unwrap();
         let first_user = &result.conversation_state.history[0];
-        if let Message::User(u) = first_user {
-            assert!(
-                !u.user_input_message.content.contains("chunked operations"),
-                "无工具时不应注入 chunked policy"
-            );
+        match first_user {
+            Message::User(u) => {
+                assert!(
+                    !u.user_input_message.content.contains("chunked operations"),
+                    "无工具时不应注入 chunked policy"
+                );
+            }
+            _ => panic!("history[0] 应该是 User 消息"),
         }
 
         // 有 Write 工具 → 注入 chunked policy
@@ -1767,7 +1779,7 @@ mod tests {
                 content: serde_json::json!("hello"),
             }],
             stream: false,
-            system: Some(system),
+            system: Some(system.clone()),
             tools: Some(vec![AnthropicTool {
                 tool_type: None,
                 name: "Write".to_string(),
@@ -1783,11 +1795,49 @@ mod tests {
 
         let result = convert_request(&req_with_write).unwrap();
         let first_user = &result.conversation_state.history[0];
-        if let Message::User(u) = first_user {
-            assert!(
-                u.user_input_message.content.contains("chunked operations"),
-                "有 Write 工具时应注入 chunked policy"
-            );
+        match first_user {
+            Message::User(u) => {
+                assert!(
+                    u.user_input_message.content.contains("chunked operations"),
+                    "有 Write 工具时应注入 chunked policy"
+                );
+            }
+            _ => panic!("history[0] 应该是 User 消息"),
+        }
+
+        // system: None + 有 Edit 工具 → 也应注入 chunked policy
+        let req_no_system_with_edit = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "Edit".to_string(),
+                description: "Edit a file".to_string(),
+                input_schema: HashMap::new(),
+                max_uses: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req_no_system_with_edit).unwrap();
+        let first_user = &result.conversation_state.history[0];
+        match first_user {
+            Message::User(u) => {
+                assert!(
+                    u.user_input_message.content.contains("chunked operations"),
+                    "system: None + 有 Edit 工具时也应注入 chunked policy"
+                );
+            }
+            _ => panic!("history[0] 应该是 User 消息"),
         }
     }
 
