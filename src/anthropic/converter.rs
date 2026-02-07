@@ -107,9 +107,9 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
-/// 按照用户要求：
+/// 映射规则：
 /// - 所有 sonnet → claude-sonnet-4.5
-/// - 所有 opus → claude-opus-4.5
+/// - opus 且显式包含 4.5/4-5 → claude-opus-4.5，否则 → claude-opus-4.6（默认最新版）
 /// - 所有 haiku → claude-haiku-4.5
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
@@ -594,11 +594,22 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
                 t.budget_tokens
             ));
         } else if t.thinking_type == "adaptive" {
-            let effort = req
+            let raw_effort = req
                 .output_config
                 .as_ref()
                 .map(|c| c.effort.as_str())
                 .unwrap_or("high");
+            // 白名单归一化：仅接受 low/medium/high，非法值回退 high
+            let effort = match raw_effort {
+                "low" | "medium" | "high" => raw_effort,
+                _ => {
+                    tracing::warn!(
+                        "未知的 thinking effort 值 '{}', 回退为 'high'",
+                        raw_effort
+                    );
+                    "high"
+                }
+            };
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
                 effort
@@ -613,12 +624,24 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+/// 检查请求的工具列表中是否包含 Write 或 Edit 工具
+fn has_write_or_edit_tool(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|t| t.name == "Write" || t.name == "Edit")
+    })
+}
+
 /// 构建历史消息
 fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
+
+    // 仅在请求包含 Write/Edit 工具时注入分块写入策略
+    let should_inject_chunked_policy = has_write_or_edit_tool(req);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -629,8 +652,12 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            // 仅在存在 Write/Edit 工具时追加分块写入策略到系统消息
+            let system_content = if should_inject_chunked_policy {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -839,10 +866,23 @@ mod tests {
 
     #[test]
     fn test_map_model_opus() {
-        assert!(
-            map_model("claude-opus-4-20250514")
-                .unwrap()
-                .contains("opus")
+        // 不含 4.5/4-5 的 opus → 默认映射到最新版 4.6
+        assert_eq!(
+            map_model("claude-opus-4-20250514").unwrap(),
+            "claude-opus-4.6"
+        );
+        assert_eq!(
+            map_model("claude-opus-4-20260206").unwrap(),
+            "claude-opus-4.6"
+        );
+        // 显式 4.5 → 保留 4.5
+        assert_eq!(
+            map_model("claude-opus-4-5-20250514").unwrap(),
+            "claude-opus-4.5"
+        );
+        assert_eq!(
+            map_model("claude-opus-4.5").unwrap(),
+            "claude-opus-4.5"
         );
     }
 
@@ -1681,5 +1721,132 @@ mod tests {
             .expect("required 应该是数组");
 
         assert_eq!(required, &vec![serde_json::Value::String("a".to_string())]);
+    }
+
+    #[test]
+    fn test_chunked_policy_injected_only_with_write_edit_tools() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage, Tool as AnthropicTool};
+        use std::collections::HashMap;
+
+        let system = vec![SystemMessage {
+            text: "You are a helpful assistant.".to_string(),
+        }];
+
+        // 无工具 → 不注入 chunked policy
+        let req_no_tools = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(system.clone()),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req_no_tools).unwrap();
+        let first_user = &result.conversation_state.history[0];
+        if let Message::User(u) = first_user {
+            assert!(
+                !u.user_input_message.content.contains("chunked operations"),
+                "无工具时不应注入 chunked policy"
+            );
+        }
+
+        // 有 Write 工具 → 注入 chunked policy
+        let req_with_write = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(system),
+            tools: Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "Write".to_string(),
+                description: "Write a file".to_string(),
+                input_schema: HashMap::new(),
+                max_uses: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req_with_write).unwrap();
+        let first_user = &result.conversation_state.history[0];
+        if let Message::User(u) = first_user {
+            assert!(
+                u.user_input_message.content.contains("chunked operations"),
+                "有 Write 工具时应注入 chunked policy"
+            );
+        }
+    }
+
+    #[test]
+    fn test_effort_whitelist_fallback() {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        // 合法值 "low"
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "low".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let prefix = generate_thinking_prefix(&req).unwrap();
+        assert!(prefix.contains("<thinking_effort>low</thinking_effort>"));
+
+        // 非法值 → 回退 "high"
+        let req_invalid = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "ultra".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let prefix = generate_thinking_prefix(&req_invalid).unwrap();
+        assert!(
+            prefix.contains("<thinking_effort>high</thinking_effort>"),
+            "非法 effort 值应回退为 high，实际: {}",
+            prefix
+        );
     }
 }
