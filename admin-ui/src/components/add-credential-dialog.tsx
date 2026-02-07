@@ -26,6 +26,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
+  const [machineId, setMachineId] = useState('')
 
   const { mutate, isPending } = useAddCredential()
 
@@ -36,6 +37,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientId('')
     setClientSecret('')
     setPriority('0')
+    setMachineId('')
   }
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -61,6 +63,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
+        machineId: machineId.trim() || undefined,
       },
       {
         onSuccess: (data) => {
@@ -176,6 +179,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 数字越小优先级越高，默认为 0
+              </p>
+            </div>
+
+            {/* Machine ID */}
+            <div className="space-y-2">
+              <label htmlFor="machineId" className="text-sm font-medium">
+                Machine ID
+              </label>
+              <Input
+                id="machineId"
+                placeholder="留空使用配置中字段, 否则由刷新Token自动派生"
+                value={machineId}
+                onChange={(e) => setMachineId(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
               </p>
             </div>
           </div>
