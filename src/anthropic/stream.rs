@@ -1034,12 +1034,14 @@ impl StreamContext {
         }
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上）
+        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
+        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
         if self.thinking_enabled
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
             self.state_manager.set_stop_reason("max_tokens");
+            events.extend(self.create_text_delta_events(" "));
         }
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
@@ -1687,6 +1689,40 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "max_tokens",
             "stop_reason should be max_tokens when only thinking is produced"
+        );
+
+        // 应补发一套完整的 text 事件（content_block_start + delta 空格 + content_block_stop）
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "text"
+            }),
+            "should emit text content_block_start"
+        );
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == " "
+            }),
+            "should emit text_delta with a single space"
+        );
+        // text block 应被 generate_final_events 自动关闭
+        let text_block_index = all_events
+            .iter()
+            .find_map(|e| {
+                if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
+                    e.data["index"].as_i64()
+                } else {
+                    None
+                }
+            })
+            .expect("text block should exist");
+        assert!(
+            all_events.iter().any(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == Some(text_block_index)
+            }),
+            "text block should be stopped"
         );
     }
 
