@@ -12,7 +12,20 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool as KiroTool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, MessagesRequest, Thinking, Tool as AnthropicTool};
+use super::types::{ContentBlock, MessagesRequest, Tool as AnthropicTool};
+
+/// 追加到 Write 工具 description 末尾的内容
+const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
+
+/// 追加到 Edit 工具 description 末尾的内容
+const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
+
+/// 追加到系统提示词的分块写入策略
+const SYSTEM_CHUNKED_POLICY: &str = "\
+When the Write or Edit tool has content size limits, always comply silently. \
+Never suggest bypassing these limits via alternative tools. \
+Never ask the user whether to switch approaches. \
+Complete all chunked operations without commentary.";
 
 fn non_empty_content_or_space(content: String, has_non_text_payload: bool) -> String {
     // Kiro 上游在部分场景下会拒绝空 content（例如仅 tool_result / 仅 image 的消息）。
@@ -104,7 +117,11 @@ pub fn map_model(model: &str) -> Option<String> {
     if model_lower.contains("sonnet") {
         Some("claude-sonnet-4.5".to_string())
     } else if model_lower.contains("opus") {
-        Some("claude-opus-4.5".to_string())
+        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+            Some("claude-opus-4.5".to_string())
+        } else {
+            Some("claude-opus-4.6".to_string())
+        }
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
     } else {
@@ -532,11 +549,23 @@ fn convert_tools(tools: &Option<Vec<AnthropicTool>>) -> Vec<KiroTool> {
             !dominated
         })
         .map(|t| {
-            let description = if t.description.trim().is_empty() {
+            let mut description = if t.description.trim().is_empty() {
                 format!("Tool: {}", t.name)
             } else {
                 t.description.clone()
             };
+
+            // 对 Write/Edit 工具追加自定义描述后缀
+            let suffix = match t.name.as_str() {
+                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+                _ => "",
+            };
+            if !suffix.is_empty() {
+                description.push('\n');
+                description.push_str(suffix);
+            }
+
             // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
             let description = match description.char_indices().nth(10000) {
                 Some((idx, _)) => description[..idx].to_string(),
@@ -557,14 +586,24 @@ fn convert_tools(tools: &Option<Vec<AnthropicTool>>) -> Vec<KiroTool> {
 }
 
 /// 生成thinking标签前缀
-fn generate_thinking_prefix(thinking: &Option<Thinking>) -> Option<String> {
-    if let Some(t) = thinking
-        && t.thinking_type == "enabled"
-    {
-        return Some(format!(
-            "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-            t.budget_tokens
-        ));
+fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
+    if let Some(t) = &req.thinking {
+        if t.thinking_type == "enabled" {
+            return Some(format!(
+                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
+                t.budget_tokens
+            ));
+        } else if t.thinking_type == "adaptive" {
+            let effort = req
+                .output_config
+                .as_ref()
+                .map(|c| c.effort.as_str())
+                .unwrap_or("high");
+            return Some(format!(
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
+                effort
+            ));
+        }
     }
     None
 }
@@ -579,7 +618,7 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(&req.thinking);
+    let thinking_prefix = generate_thinking_prefix(req);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -590,6 +629,9 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
             .join("\n");
 
         if !system_content.is_empty() {
+            // 追加分块写入策略到系统消息
+            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
                 if !has_thinking_tags(&system_content) {
@@ -830,6 +872,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
@@ -908,6 +951,7 @@ mod tests {
             tools: None, // 没有提供工具定义
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -972,6 +1016,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: Some(Metadata {
                 user_id: Some(
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
@@ -1003,6 +1048,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1380,6 +1426,7 @@ mod tests {
             }]),
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1438,6 +1485,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 
@@ -1494,6 +1542,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
+            output_config: None,
             metadata: None,
         };
 

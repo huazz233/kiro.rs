@@ -104,6 +104,15 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 32000,
         },
         Model {
+            id: "claude-opus-4-6-20260206".to_string(),
+            object: "model".to_string(),
+            created: 1770314400,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.6".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+        },
+        Model {
             id: "claude-haiku-4-5-20251001".to_string(),
             object: "model".to_string(),
             created: 1727740800,
@@ -243,7 +252,7 @@ pub async fn post_messages(
     let thinking_enabled = payload
         .thinking
         .as_ref()
-        .map(|t| t.thinking_type == "enabled")
+        .map(|t| t.is_enabled())
         .unwrap_or(false);
 
     if payload.stream {
@@ -712,7 +721,7 @@ pub async fn post_messages_cc(
     let thinking_enabled = payload
         .thinking
         .as_ref()
-        .map(|t| t.thinking_type == "enabled")
+        .map(|t| t.is_enabled())
         .unwrap_or(false);
 
     if payload.stream {
