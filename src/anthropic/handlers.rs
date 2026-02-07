@@ -445,6 +445,10 @@ async fn handle_non_stream_request(
                                 / 100.0)
                                 as i32;
                             context_input_tokens = Some(actual_input_tokens);
+                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
+                            if context_usage.context_usage_percentage >= 100.0 {
+                                stop_reason = "model_context_window_exceeded".to_string();
+                            }
                             tracing::debug!(
                                 "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
                                 context_usage.context_usage_percentage,
