@@ -161,13 +161,21 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
         try {
           // 添加凭据
-          const authMethod = cred.clientId && cred.clientSecret ? 'idc' : 'social'
+          const clientId = cred.clientId?.trim() || undefined
+          const clientSecret = cred.clientSecret?.trim() || undefined
+          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+
+          // idc 模式下必须同时提供 clientId 和 clientSecret
+          if (authMethod === 'social' && (clientId || clientSecret)) {
+            throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
             region: cred.region?.trim() || undefined,
-            clientId: cred.clientId?.trim() || undefined,
-            clientSecret: cred.clientSecret?.trim() || undefined,
+            clientId,
+            clientSecret,
             priority: cred.priority || 0,
           })
 
