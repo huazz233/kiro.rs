@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Added
+- **合并 upstream 新功能**: 从 upstream/master 拉取并融合大量新特性
+  - **负载均衡模式** (`src/model/config.rs`, `src/kiro/token_manager.rs`, `src/admin/`)
+    - 新增 `loadBalancingMode` 配置项，支持 `priority`（默认）和 `balanced`（Least-Used）两种模式
+    - Admin API 新增 `GET/PUT /config/load-balancing` 端点
+    - 前端新增负载均衡模式切换开关
+  - **凭据统计与持久化** (`src/kiro/token_manager.rs`)
+    - 新增 `success_count`、`last_used_at` 字段，跟踪每个凭据的调用统计
+    - 新增 `save_stats_debounced` 防抖持久化机制，`Drop` 时自动保存
+    - 新增 `refreshTokenHash` 字段用于前端重复检测
+  - **前端批量操作** (`admin-ui/src/components/dashboard.tsx`)
+    - 批量导入对话框 (`BatchImportDialog`)
+    - 批量验活对话框 (`BatchVerifyDialog`)
+    - 分页控件、批量选择/删除/恢复/验活功能
+    - 凭据卡片新增 Checkbox 选择、email 显示、订阅等级、成功次数、剩余用量等信息
+  - **配置文件路径管理** (`src/model/config.rs`)
+    - `Config` 新增 `config_path` 字段和 `load()`/`save()` 方法，支持配置回写
+  - **前端依赖**: 新增 `@radix-ui/react-checkbox` 组件
+
 ### Fixed
 - **[P0] API Key 日志泄露修复** (`src/main.rs`)
   - info 级别不再打印 API Key 前半段，仅显示末 4 位和长度

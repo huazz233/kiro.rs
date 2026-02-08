@@ -13,6 +13,8 @@ import {
   resetCredentialStats,
   resetAllStats,
   importTokenJson,
+  getLoadBalancingMode,
+  setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest, ImportTokenJsonRequest } from '@/types/api'
 
@@ -157,6 +159,25 @@ export function useImportTokenJson() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
       queryClient.invalidateQueries({ queryKey: ['cached-balances'] })
+    },
+  })
+}
+
+// 获取负载均衡模式
+export function useLoadBalancingMode() {
+  return useQuery({
+    queryKey: ['loadBalancingMode'],
+    queryFn: getLoadBalancingMode,
+  })
+}
+
+// 设置负载均衡模式
+export function useSetLoadBalancingMode() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setLoadBalancingMode,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
     },
   })
 }

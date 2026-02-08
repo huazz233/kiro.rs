@@ -57,6 +57,10 @@ pub struct KiroCredentials {
     /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+
+    /// 用户邮箱（从 Anthropic API 获取）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -244,6 +248,7 @@ mod tests {
             priority: 0,
             region: None,
             machine_id: None,
+            email: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -354,6 +359,7 @@ mod tests {
             priority: 0,
             region: Some("eu-west-1".to_string()),
             machine_id: None,
+            email: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -376,6 +382,7 @@ mod tests {
             priority: 0,
             region: None,
             machine_id: None,
+            email: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -480,6 +487,7 @@ mod tests {
             priority: 3,
             region: Some("us-west-2".to_string()),
             machine_id: Some("c".repeat(64)),
+            email: None,
         };
 
         let json = original.to_pretty_json().unwrap();

@@ -8,11 +8,16 @@
 
 /admin-ui/node_modules/
 /admin-ui/dist/
-
+/admin-ui/pnpm-lock.yaml
+/admin-ui/package-lock.json
 /admin-ui/tsconfig.tsbuildinfo
+
 .claude/
 /credentials.*
 
 *.json
 logs/
 data/
+
+/kiro_balance_cache.json
+/kiro_stats.json

@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, ImportTokenJsonRequest, SetDisabledRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, ImportTokenJsonRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -120,4 +120,23 @@ pub async fn import_token_json(
 ) -> impl IntoResponse {
     let response = state.service.import_token_json(payload).await;
     Json(response)
+}
+
+/// GET /api/admin/config/load-balancing
+/// 获取负载均衡模式
+pub async fn get_load_balancing_mode(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_load_balancing_mode();
+    Json(response)
+}
+
+/// PUT /api/admin/config/load-balancing
+/// 设置负载均衡模式
+pub async fn set_load_balancing_mode(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetLoadBalancingModeRequest>,
+) -> impl IntoResponse {
+    match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }

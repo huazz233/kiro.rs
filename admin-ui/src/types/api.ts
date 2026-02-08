@@ -15,6 +15,8 @@ export interface CredentialStatusItem {
   authMethod: string | null
   hasProfileArn: boolean
   accountEmail: string | null
+  email?: string
+  refreshTokenHash?: string
 
   // ===== 统计（可持久化） =====
   callsTotal: number
@@ -26,6 +28,10 @@ export interface CredentialStatusItem {
   lastSuccessAt: string | null
   lastErrorAt: string | null
   lastError: string | null
+
+  // ===== upstream 字段 =====
+  successCount: number
+  lastUsedAt: string | null
 }
 
 // 余额响应
@@ -114,6 +120,7 @@ export interface AddCredentialRequest {
   clientSecret?: string
   priority?: number
   region?: string
+  machineId?: string
 }
 
 // 添加凭据响应
@@ -121,6 +128,7 @@ export interface AddCredentialResponse {
   success: boolean
   message: string
   credentialId: number
+  email?: string
 }
 
 // ===== 账号信息（套餐/用量/邮箱等） =====
