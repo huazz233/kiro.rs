@@ -23,9 +23,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{
-    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-};
+use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
 /// GET /v1/models
@@ -45,11 +43,29 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 32000,
         },
         Model {
+            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1727568000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+        },
+        Model {
             id: "claude-opus-4-5-20251101".to_string(),
             object: "model".to_string(),
             created: 1730419200,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+        },
+        Model {
+            id: "claude-opus-4-5-20251101-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1730419200,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
         },
@@ -63,11 +79,29 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 32000,
         },
         Model {
+            id: "claude-opus-4-6-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1770314400,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+        },
+        Model {
             id: "claude-haiku-4-5-20251001".to_string(),
             object: "model".to_string(),
             created: 1727740800,
             owned_by: "anthropic".to_string(),
             display_name: "Claude Haiku 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 32000,
+        },
+        Model {
+            id: "claude-haiku-4-5-20251001-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1727740800,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 32000,
         },
@@ -84,7 +118,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
         model = %payload.model,
@@ -108,6 +142,9 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -511,6 +548,44 @@ async fn handle_non_stream_request(
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
+/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+///
+/// - Opus 4.6：覆写为 adaptive 类型
+/// - 其他模型：覆写为 enabled 类型
+/// - budget_tokens 固定为 20000
+fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+    let model_lower = payload.model.to_lowercase();
+    if !model_lower.contains("thinking") {
+        return;
+    }
+
+    let is_opus_4_6 =
+        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+
+    let thinking_type = if is_opus_4_6 {
+        "adaptive"
+    } else {
+        "enabled"
+    };
+
+    tracing::info!(
+        model = %payload.model,
+        thinking_type = thinking_type,
+        "模型名包含 thinking 后缀，覆写 thinking 配置"
+    );
+
+    payload.thinking = Some(Thinking {
+        thinking_type: thinking_type.to_string(),
+        budget_tokens: 20000,
+    });
+    
+    if is_opus_4_6 {
+        payload.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+        });
+    }
+}
+
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
@@ -542,7 +617,7 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
         model = %payload.model,
@@ -567,6 +642,9 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
