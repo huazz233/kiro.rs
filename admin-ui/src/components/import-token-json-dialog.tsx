@@ -226,8 +226,12 @@ export function ImportTokenJsonDialog({ open, onOpenChange }: ImportTokenJsonDia
             // 开启验活模式：导入后自动验活
             if (response.summary.added > 0) {
               toast.success(`成功导入 ${response.summary.added} 个凭据，开始验活...`)
+              runVerification(response.items)
+            } else {
+              // 没有新增凭据，直接显示结果
+              setStep('result')
+              toast.info('没有新增凭据需要验活')
             }
-            runVerification(response.items)
           } else {
             // 普通模式：直接显示结果
             setStep('result')

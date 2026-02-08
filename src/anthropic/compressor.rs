@@ -184,7 +184,7 @@ fn remove_thinking_blocks(text: &str) -> String {
         }
     }
     result.push_str(remaining);
-    result.trim().to_string()
+    result
 }
 
 /// 截断 `<thinking>...</thinking>` 块内容，保留前 N 个字符
@@ -429,8 +429,8 @@ fn compress_history_pass(
                 .history
                 .iter()
                 .map(|msg| match msg {
-                    Message::User(u) => u.user_input_message.content.len(),
-                    Message::Assistant(a) => a.assistant_response_message.content.len(),
+                    Message::User(u) => u.user_input_message.content.chars().count(),
+                    Message::Assistant(a) => a.assistant_response_message.content.chars().count(),
                 })
                 .sum();
 

@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed
+- **历史截断字符统计口径修正** (`src/anthropic/compressor.rs`)
+  - `max_history_chars` 从按字节 `.len()` 改为按字符 `.chars().count()`，与配置语义一致
+- **remove_thinking_blocks 不再全局 trim** (`src/anthropic/compressor.rs`)
+  - 移除末尾 `.trim()`，避免意外吞掉原始内容的首尾空白
+- **token.json 导入注释/逻辑统一** (`src/admin/service.rs`)
+  - 更新注释：`builder-id → idc`（与实际映射一致）
+  - 删除 `auth_method == "builder-id"` 死分支
+- **Admin UI 验活开关 added=0 卡住修复** (`admin-ui/src/components/import-token-json-dialog.tsx`)
+  - `enableVerify` 开启但无新增凭据时，直接跳转 result 步骤而非卡在 preview
+- **工具描述截断 max_description_chars=0 语义修正** (`src/anthropic/converter.rs`)
+  - `0` 现在表示"不截断"，而非截断为空字符串
+
 ### Added
 - **输入压缩管道** (`src/anthropic/compressor.rs`)
   - 新增 5 层压缩管道，规避 Kiro 上游 ~400KB 请求体大小限制

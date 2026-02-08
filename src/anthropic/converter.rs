@@ -610,10 +610,14 @@ fn convert_tools(
                 description.push_str(suffix);
             }
 
-            // 限制描述长度（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(max_description_chars) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
+            // 限制描述长度（0=不截断；安全截断 UTF-8，单次遍历）
+            let description = if max_description_chars > 0 {
+                match description.char_indices().nth(max_description_chars) {
+                    Some((idx, _)) => description[..idx].to_string(),
+                    None => description,
+                }
+            } else {
+                description
             };
 
             let schema = normalize_json_schema(serde_json::json!(t.input_schema));

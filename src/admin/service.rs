@@ -425,8 +425,7 @@ impl AdminService {
     /// 批量导入 token.json
     ///
     /// 解析官方 token.json 格式，按 provider 字段自动映射 authMethod：
-    /// - BuilderId/builder-id → builder-id
-    /// - IdC/idc → idc
+    /// - BuilderId/builder-id/idc → idc
     /// - Social/social → social
     pub async fn import_token_json(&self, req: ImportTokenJsonRequest) -> ImportTokenJsonResponse {
         let items = req.items.into_vec();
@@ -485,10 +484,8 @@ impl AdminService {
         // 映射 authMethod
         let auth_method = Self::map_auth_method(&item);
 
-        // IdC/builder-id 需要 clientId 和 clientSecret
-        if (auth_method == "idc" || auth_method == "builder-id")
-            && (item.client_id.is_none() || item.client_secret.is_none())
-        {
+        // IdC 需要 clientId 和 clientSecret
+        if auth_method == "idc" && (item.client_id.is_none() || item.client_secret.is_none()) {
             return ImportItemResult {
                 index,
                 fingerprint,
