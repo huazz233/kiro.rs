@@ -54,7 +54,7 @@ pub async fn get_models() -> impl IntoResponse {
             max_tokens: 32000,
         },
         Model {
-            id: "claude-opus-4-6-20260206".to_string(),
+            id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
             created: 1770314400,
             owned_by: "anthropic".to_string(),
