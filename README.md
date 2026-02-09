@@ -18,11 +18,15 @@
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
+- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
+- **WebSearch**: 内置 WebSearch 工具转换逻辑
 - **多模型支持**: 支持 Sonnet、Opus、Haiku 系列模型
+- **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
+- **多级 Region 配置**: 支持全局和凭据级别的 Auth Region / API Region 配置
 
 ## 支持的 API 端点
 
@@ -70,17 +74,20 @@ cargo build --release
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",  // 必配, 请求的鉴权 token
    "region": "us-east-1",  // 必配, 区域, 一般保持默认即可
    "tlsBackend": "rustls", // 可选, TLS 后端: rustls / native-tls
-   "kiroVersion": "0.8.0",  // 可选, 用于自定义请求特征, 不需要请删除: kiro ide 版本
+   "kiroVersion": "0.9.2",  // 可选, 用于自定义请求特征, 不需要请删除: kiro ide 版本
    "machineId": "如果你需要自定义机器码请将64位机器码填到这里", // 可选, 用于自定义请求特征, 不需要请删除: 机器码
    "systemVersion": "darwin#24.6.0",  // 可选, 用于自定义请求特征, 不需要请删除: 系统版本
    "nodeVersion": "22.21.1",  // 可选, 用于自定义请求特征, 不需要请删除: node 版本
    "countTokensApiUrl": "https://api.example.com/v1/messages/count_tokens", // 可选, 用于自定义token统计API, 不需要请删除
    "countTokensApiKey": "sk-your-count-tokens-api-key",  // 可选, 用于自定义token统计API, 不需要请删除
    "countTokensAuthType": "x-api-key",  // 可选, 用于自定义token统计API, 不需要请删除
+   "authRegion": "us-east-1",  // 可选, Auth Region（用于 Token 刷新），未配置时回退到 region, 不需要请删除
+   "apiRegion": "us-east-1",  // 可选, API Region（用于 API 请求），未配置时回退到 region, 不需要请删除
    "proxyUrl": "http://127.0.0.1:7890", // 可选, HTTP/SOCK5代理, 不需要请删除
    "proxyUsername": "user",  // 可选, HTTP/SOCK5代理用户名, 不需要请删除
    "proxyPassword": "pass",  // 可选, HTTP/SOCK5代理密码, 不需要请删除
-   "adminApiKey": "sk-admin-your-secret-key"  // 可选, Admin API 密钥, 用于启用凭据管理 API, 填写后才会启用web管理， 不需要请删除
+   "adminApiKey": "sk-admin-your-secret-key",  // 可选, Admin API 密钥, 用于启用凭据管理 API, 填写后才会启用web管理， 不需要请删除
+   "loadBalancingMode": "priority"  // 可选, 负载均衡模式: priority / balanced, 默认 priority, 不需要请删除
 }
 ```
 最小启动配置为: 
@@ -139,6 +146,8 @@ cargo build --release
 > - 自动故障转移到下一个可用凭据
 > - 多凭据格式下 Token 刷新后自动回写到源文件
 > - 可选的 `region` 字段：用于 OIDC token 刷新时指定 endpoint 区域，未配置时回退到 config.json 的 region
+> - 可选的 `authRegion` 字段：凭据级 Auth Region，用于 Token 刷新。优先级：凭据.authRegion > 凭据.region > config.authRegion > config.region
+> - 可选的 `apiRegion` 字段：凭据级 API Region，用于 API 请求。优先级：凭据.apiRegion > config.apiRegion > config.region
 > - 可选的 `machineId` 字段：凭据级机器码；未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
 
 最小启动配置(social):
@@ -197,7 +206,9 @@ curl http://127.0.0.1:8990/v1/messages \
 | `port` | number | `8080` | 服务监听端口                  |
 | `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
 | `region` | string | `us-east-1` | AWS 区域                  |
-| `kiroVersion` | string | `0.8.0` | Kiro 版本号                |
+| `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region（可选） |
+| `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region（可选） |
+| `kiroVersion` | string | `0.9.2` | Kiro 版本号                |
 | `machineId` | string | - | 自定义机器码（64位十六进制）不定义则自动生成 |
 | `systemVersion` | string | 随机 | 系统版本标识                  |
 | `nodeVersion` | string | `22.21.1` | Node.js 版本标识            |
@@ -209,6 +220,7 @@ curl http://127.0.0.1:8990/v1/messages \
 | `proxyUsername` | string | - | 代理用户名（可选） |
 | `proxyPassword` | string | - | 代理密码（可选） |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API, 填写后才会启用web管理（可选） |
+| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配）（可选） |
 
 ### credentials.json
 
@@ -226,7 +238,10 @@ curl http://127.0.0.1:8990/v1/messages \
 | `clientSecret` | string | IdC 登录的客户端密钥（可选）      |
 | `priority` | number | 凭据优先级，数字越小越优先，默认为 0（多凭据格式时有效）|
 | `region` | string | 凭据级 region（可选），用于 OIDC token 刷新时指定 endpoint 的区域。未配置时回退到 config.json 的 region。注意：API 调用始终使用 config.json 的 region |
+| `authRegion` | string | 凭据级 Auth Region（可选），用于 Token 刷新。优先级：凭据.authRegion > 凭据.region > config.authRegion > config.region |
+| `apiRegion` | string | 凭据级 API Region（可选），用于 API 请求。优先级：凭据.apiRegion > config.apiRegion > config.region |
 | `machineId` | string | 凭据级机器码（可选，64位十六进制）。未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生 |
+| `email` | string | 用户邮箱（可选，从 API 获取） |
 
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
@@ -237,7 +252,8 @@ curl http://127.0.0.1:8990/v1/messages \
 | Anthropic 模型 | Kiro 模型 |
 |----------------|-----------|
 | `*sonnet*` | `claude-sonnet-4.5` |
-| `*opus*` | `claude-opus-4.5` |
+| `*opus*`（含 4.5/4-5） | `claude-opus-4.5` |
+| `*opus*`（其他） | `claude-opus-4.6` |
 | `*haiku*` | `claude-haiku-4.5` |
 
 ## 项目结构
@@ -246,6 +262,10 @@ curl http://127.0.0.1:8990/v1/messages \
 kiro-rs/
 ├── src/
 │   ├── main.rs                 # 程序入口
+│   ├── http_client.rs          # HTTP 客户端构建
+│   ├── token.rs                # Token 计算模块
+│   ├── debug.rs                # 调试工具
+│   ├── test.rs                 # 测试
 │   ├── model/                  # 配置和参数模型
 │   │   ├── config.rs           # 应用配置
 │   │   └── arg.rs              # 命令行参数
@@ -256,25 +276,40 @@ kiro-rs/
 │   │   ├── types.rs            # 类型定义
 │   │   ├── converter.rs        # 协议转换器
 │   │   ├── stream.rs           # 流式响应处理
-│   │   └── token.rs            # Token 估算
-│   └── kiro/                   # Kiro API 客户端
-│       ├── provider.rs         # API 提供者
-│       ├── token_manager.rs    # Token 管理
-│       ├── machine_id.rs       # 设备指纹生成
-│       ├── model/              # 数据模型
-│       │   ├── credentials.rs  # OAuth 凭证
-│       │   ├── events/         # 响应事件类型
-│       │   ├── requests/       # 请求类型
-│       │   └── common/         # 共享类型
-│       └── parser/             # AWS Event Stream 解析器
-│           ├── decoder.rs      # 流式解码器
-│           ├── frame.rs        # 帧解析
-│           ├── header.rs       # 头部解析
-│           └── crc.rs          # CRC 校验
-├── Cargo.toml                  # 项目配置
-├── config.example.json         # 配置示例
+│   │   └── websearch.rs        # WebSearch 工具处理
+│   ├── kiro/                   # Kiro API 客户端
+│   │   ├── provider.rs         # API 提供者
+│   │   ├── token_manager.rs    # Token 管理
+│   │   ├── machine_id.rs       # 设备指纹生成
+│   │   ├── model/              # 数据模型
+│   │   │   ├── credentials.rs  # OAuth 凭证
+│   │   │   ├── events/         # 响应事件类型
+│   │   │   ├── requests/       # 请求类型
+│   │   │   ├── common/         # 共享类型
+│   │   │   ├── token_refresh.rs # Token 刷新模型
+│   │   │   └── usage_limits.rs # 使用额度模型
+│   │   └── parser/             # AWS Event Stream 解析器
+│   │       ├── decoder.rs      # 流式解码器
+│   │       ├── frame.rs        # 帧解析
+│   │       ├── header.rs       # 头部解析
+│   │       ├── error.rs        # 错误类型
+│   │       └── crc.rs          # CRC 校验
+│   ├── admin/                  # Admin API 模块
+│   │   ├── router.rs           # 路由配置
+│   │   ├── handlers.rs         # 请求处理器
+│   │   ├── service.rs          # 业务逻辑服务
+│   │   ├── types.rs            # 类型定义
+│   │   ├── middleware.rs       # 认证中间件
+│   │   └── error.rs            # 错误处理
+│   ├── admin_ui/               # Admin UI 静态文件嵌入
+│   │   └── router.rs           # 静态文件路由
+│   └── common/                 # 公共模块
+│       └── auth.rs             # 认证工具函数
 ├── admin-ui/                   # Admin UI 前端工程（构建产物会嵌入二进制）
 ├── tools/                      # 辅助工具
+├── Cargo.toml                  # 项目配置
+├── config.example.json         # 配置示例
+├── docker-compose.yml          # Docker Compose 配置
 └── Dockerfile                  # Docker 构建文件
 ```
 
