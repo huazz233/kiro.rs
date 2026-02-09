@@ -1,5 +1,16 @@
 # Changelog
 
+## [v1.0.4] - 2026-02-09
+
+### Changed
+- **Docker 构建优化**: 引入 `cargo-chef` 实现依赖层缓存，大幅加速重复构建
+  - 新增 `planner` 阶段生成依赖 recipe，`builder` 阶段先编译依赖再编译源码
+  - Docker 层缓存使得仅源码变更时无需重新编译所有依赖
+- **GitHub Actions Docker 构建缓存**: 启用 GHA 缓存（`cache-from/cache-to: type=gha`）
+- **Cargo.toml 优化**:
+  - `lto` 从 `true`（fat LTO）改为 `"thin"`，加快编译速度同时保持较好的优化效果
+  - `tokio` features 从 `full` 精简为实际使用的 5 个 feature（`rt-multi-thread`, `macros`, `net`, `time`, `sync`），减小编译体积
+
 ## [v1.0.3] - 2026-02-09
 
 ### Fixed

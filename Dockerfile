@@ -1,19 +1,32 @@
-FROM node:24-alpine AS frontend-builder
+FROM rust:1.93-alpine AS chef
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
+RUN cargo install cargo-chef
+WORKDIR /app
 
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM node:24-alpine AS frontend-builder
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json ./
 RUN npm install -g pnpm && pnpm install
 COPY admin-ui ./
 RUN pnpm build
 
-FROM rust:1.93-alpine AS builder
+FROM chef AS builder
 
 # 可选：启用敏感日志输出（仅用于排障）
 ARG ENABLE_SENSITIVE_LOGS=false
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
+COPY --from=planner /app/recipe.json recipe.json
+RUN if [ "$ENABLE_SENSITIVE_LOGS" = "true" ]; then \
+        cargo chef cook --release --features sensitive-logs --recipe-path recipe.json; \
+    else \
+        cargo chef cook --release --recipe-path recipe.json; \
+    fi
 
-WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
