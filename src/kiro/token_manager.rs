@@ -171,8 +171,8 @@ async fn refresh_social_token(
     tracing::info!("正在刷新 Social Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
-    // 优先使用凭据级 region，未配置时回退到 config.region
-    let region = credentials.region.as_ref().unwrap_or(&config.region);
+    // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
+    let region = credentials.effective_auth_region(config);
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
@@ -255,8 +255,8 @@ async fn refresh_idc_token(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("IdC 刷新需要 clientSecret"))?;
 
-    // 优先使用凭据级 region，未配置时回退到 config.region
-    let region = credentials.region.as_ref().unwrap_or(&config.region);
+    // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
+    let region = credentials.effective_auth_region(config);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
@@ -324,7 +324,8 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    let region = &config.region;
+    // 优先级：凭据.api_region > config.api_region > config.region
+    let region = credentials.effective_api_region(config);
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
         .ok_or_else(|| anyhow::anyhow!("无法生成 machineId"))?;
@@ -1427,6 +1428,8 @@ impl MultiTokenManager {
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;
+        validated_cred.auth_region = new_cred.auth_region;
+        validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
 
@@ -1886,87 +1889,90 @@ mod tests {
 
     // ============ 凭据级 Region 优先级测试 ============
 
-    /// 辅助函数：获取 OIDC 刷新使用的 region（用于测试）
-    fn get_oidc_region_for_credential<'a>(
-        credentials: &'a KiroCredentials,
-        config: &'a Config,
-    ) -> &'a str {
-        credentials.region.as_ref().unwrap_or(&config.region)
-    }
-
     #[test]
-    fn test_credential_region_priority_uses_credential_region() {
-        // 凭据配置了 region 时，应使用凭据的 region
+    fn test_credential_region_priority_uses_credential_auth_region() {
+        // 凭据配置了 auth_region 时，应使用凭据的 auth_region
         let mut config = Config::default();
         config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
-        credentials.region = Some("eu-west-1".to_string());
+        credentials.auth_region = Some("eu-west-1".to_string());
 
-        let region = get_oidc_region_for_credential(&credentials, &config);
+        let region = credentials.effective_auth_region(&config);
         assert_eq!(region, "eu-west-1");
     }
 
     #[test]
-    fn test_credential_region_priority_fallback_to_config() {
-        // 凭据未配置 region 时，应回退到 config.region
-        let mut config = Config::default();
-        config.region = "us-west-2".to_string();
-
-        let credentials = KiroCredentials::default();
-        assert!(credentials.region.is_none());
-
-        let region = get_oidc_region_for_credential(&credentials, &config);
-        assert_eq!(region, "us-west-2");
-    }
-
-    #[test]
-    fn test_multiple_credentials_use_respective_regions() {
-        // 多凭据场景下，不同凭据使用各自的 region
-        let mut config = Config::default();
-        config.region = "ap-northeast-1".to_string();
-
-        let mut cred1 = KiroCredentials::default();
-        cred1.region = Some("us-east-1".to_string());
-
-        let mut cred2 = KiroCredentials::default();
-        cred2.region = Some("eu-west-1".to_string());
-
-        let cred3 = KiroCredentials::default(); // 无 region，使用 config
-
-        assert_eq!(get_oidc_region_for_credential(&cred1, &config), "us-east-1");
-        assert_eq!(get_oidc_region_for_credential(&cred2, &config), "eu-west-1");
-        assert_eq!(
-            get_oidc_region_for_credential(&cred3, &config),
-            "ap-northeast-1"
-        );
-    }
-
-    #[test]
-    fn test_idc_oidc_endpoint_uses_credential_region() {
-        // 验证 IdC OIDC endpoint URL 使用凭据 region
+    fn test_credential_region_priority_fallback_to_credential_region() {
+        // 凭据未配置 auth_region 但配置了 region 时，应回退到凭据.region
         let mut config = Config::default();
         config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.region = Some("eu-central-1".to_string());
 
-        let region = get_oidc_region_for_credential(&credentials, &config);
+        let region = credentials.effective_auth_region(&config);
+        assert_eq!(region, "eu-central-1");
+    }
+
+    #[test]
+    fn test_credential_region_priority_fallback_to_config() {
+        // 凭据未配置 auth_region 和 region 时，应回退到 config
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let credentials = KiroCredentials::default();
+        assert!(credentials.auth_region.is_none());
+        assert!(credentials.region.is_none());
+
+        let region = credentials.effective_auth_region(&config);
+        assert_eq!(region, "us-west-2");
+    }
+
+    #[test]
+    fn test_multiple_credentials_use_respective_regions() {
+        // 多凭据场景下，不同凭据使用各自的 auth_region
+        let mut config = Config::default();
+        config.region = "ap-northeast-1".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.auth_region = Some("us-east-1".to_string());
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.region = Some("eu-west-1".to_string());
+
+        let cred3 = KiroCredentials::default(); // 无 region，使用 config
+
+        assert_eq!(cred1.effective_auth_region(&config), "us-east-1");
+        assert_eq!(cred2.effective_auth_region(&config), "eu-west-1");
+        assert_eq!(cred3.effective_auth_region(&config), "ap-northeast-1");
+    }
+
+    #[test]
+    fn test_idc_oidc_endpoint_uses_credential_auth_region() {
+        // 验证 IdC OIDC endpoint URL 使用凭据 auth_region
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("eu-central-1".to_string());
+
+        let region = credentials.effective_auth_region(&config);
         let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
 
         assert_eq!(refresh_url, "https://oidc.eu-central-1.amazonaws.com/token");
     }
 
     #[test]
-    fn test_social_refresh_endpoint_uses_credential_region() {
-        // 验证 Social refresh endpoint URL 使用凭据 region
+    fn test_social_refresh_endpoint_uses_credential_auth_region() {
+        // 验证 Social refresh endpoint URL 使用凭据 auth_region
         let mut config = Config::default();
         config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
-        credentials.region = Some("ap-southeast-1".to_string());
+        credentials.auth_region = Some("ap-southeast-1".to_string());
 
-        let region = get_oidc_region_for_credential(&credentials, &config);
+        let region = credentials.effective_auth_region(&config);
         let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
 
         assert_eq!(
@@ -1976,35 +1982,61 @@ mod tests {
     }
 
     #[test]
-    fn test_api_call_still_uses_config_region() {
-        // 验证 API 调用（如 getUsageLimits）仍使用 config.region
-        // 这确保只有 OIDC 刷新使用凭据 region，API 调用行为不变
+    fn test_api_call_uses_effective_api_region() {
+        // 验证 API 调用使用 effective_api_region
         let mut config = Config::default();
         config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.region = Some("eu-west-1".to_string());
 
-        // API 调用应使用 config.region，而非 credentials.region
-        let api_region = &config.region;
+        // 凭据.region 不参与 api_region 回退链
+        let api_region = credentials.effective_api_region(&config);
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
         assert_eq!(api_host, "q.us-west-2.amazonaws.com");
-        // 确认凭据 region 不影响 API 调用
-        assert_ne!(api_region, credentials.region.as_ref().unwrap());
     }
 
     #[test]
-    fn test_credential_region_empty_string_treated_as_set() {
-        // 空字符串 region 被视为已设置（虽然不推荐，但行为应一致）
+    fn test_api_call_uses_credential_api_region() {
+        // 凭据配置了 api_region 时，API 调用应使用凭据的 api_region
         let mut config = Config::default();
         config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
-        credentials.region = Some("".to_string());
+        credentials.api_region = Some("eu-central-1".to_string());
 
-        let region = get_oidc_region_for_credential(&credentials, &config);
+        let api_region = credentials.effective_api_region(&config);
+        let api_host = format!("q.{}.amazonaws.com", api_region);
+
+        assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+    }
+
+    #[test]
+    fn test_credential_region_empty_string_treated_as_set() {
+        // 空字符串 auth_region 被视为已设置（虽然不推荐，但行为应一致）
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("".to_string());
+
+        let region = credentials.effective_auth_region(&config);
         // 空字符串被视为已设置，不会回退到 config
         assert_eq!(region, "");
+    }
+
+    #[test]
+    fn test_auth_and_api_region_independent() {
+        // auth_region 和 api_region 互不影响
+        let mut config = Config::default();
+        config.region = "default".to_string();
+
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_region = Some("auth-only".to_string());
+        credentials.api_region = Some("api-only".to_string());
+
+        assert_eq!(credentials.effective_auth_region(&config), "auth-only");
+        assert_eq!(credentials.effective_api_region(&config), "api-only");
     }
 }

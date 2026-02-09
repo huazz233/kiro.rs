@@ -13,10 +13,8 @@ use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
-use crate::kiro::token_manager::{CallContext, MultiTokenManager};
-
-#[cfg(test)]
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::token_manager::{CallContext, MultiTokenManager};
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -55,25 +53,49 @@ impl KiroProvider {
         &self.token_manager
     }
 
-    /// 获取 API 基础 URL
+    /// 获取 API 基础 URL（使用 config 级 api_region）
     pub fn base_url(&self) -> String {
         format!(
             "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.token_manager.config().region
+            self.token_manager.config().effective_api_region()
         )
     }
 
-    /// 获取 MCP API URL
+    /// 获取 MCP API URL（使用 config 级 api_region）
     pub fn mcp_url(&self) -> String {
         format!(
             "https://q.{}.amazonaws.com/mcp",
-            self.token_manager.config().region
+            self.token_manager.config().effective_api_region()
         )
     }
 
-    /// 获取 API 基础域名
+    /// 获取 API 基础域名（使用 config 级 api_region）
     pub fn base_domain(&self) -> String {
-        format!("q.{}.amazonaws.com", self.token_manager.config().region)
+        format!("q.{}.amazonaws.com", self.token_manager.config().effective_api_region())
+    }
+
+    /// 获取凭据级 API 基础 URL
+    fn base_url_for(&self, credentials: &KiroCredentials) -> String {
+        format!(
+            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            credentials.effective_api_region(self.token_manager.config())
+        )
+    }
+
+    /// 获取凭据级 MCP API URL
+    fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
+        format!(
+            "https://q.{}.amazonaws.com/mcp",
+            credentials.effective_api_region(self.token_manager.config())
+        )
+    }
+
+    /// 获取凭据级 API 基础域名
+    fn base_domain_for(&self, credentials: &KiroCredentials) -> String {
+        format!(
+            "q.{}.amazonaws.com",
+            credentials.effective_api_region(self.token_manager.config())
+        )
     }
 
     /// 构建请求头
@@ -113,7 +135,7 @@ impl KiroProvider {
             reqwest::header::USER_AGENT,
             HeaderValue::from_str(&user_agent).unwrap(),
         );
-        headers.insert(HOST, HeaderValue::from_str(&self.base_domain()).unwrap());
+        headers.insert(HOST, HeaderValue::from_str(&self.base_domain_for(&ctx.credentials)).unwrap());
         headers.insert(
             "amz-sdk-invocation-id",
             HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
@@ -158,7 +180,7 @@ impl KiroProvider {
             HeaderValue::from_str(&x_amz_user_agent).unwrap(),
         );
         headers.insert("user-agent", HeaderValue::from_str(&user_agent).unwrap());
-        headers.insert("host", HeaderValue::from_str(&self.base_domain()).unwrap());
+        headers.insert("host", HeaderValue::from_str(&self.base_domain_for(&ctx.credentials)).unwrap());
         headers.insert(
             "amz-sdk-invocation-id",
             HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
@@ -239,7 +261,7 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.mcp_url();
+            let url = self.mcp_url_for(&ctx.credentials);
             let headers = match self.build_mcp_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {
@@ -368,7 +390,7 @@ impl KiroProvider {
                 }
             };
 
-            let url = self.base_url();
+            let url = self.base_url_for(&ctx.credentials);
             let headers = match self.build_headers(&ctx) {
                 Ok(h) => h,
                 Err(e) => {

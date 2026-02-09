@@ -91,6 +91,12 @@ pub struct AddCredentialRequest {
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
 
+    /// 凭据级 Auth Region（用于 Token 刷新）
+    pub auth_region: Option<String>,
+
+    /// 凭据级 API Region（用于 API 请求）
+    pub api_region: Option<String>,
+
     /// 凭据级 Machine ID（可选，64 位字符串）
     /// 未配置时回退到 config.json 的 machineId
     pub machine_id: Option<String>,

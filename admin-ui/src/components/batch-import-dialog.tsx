@@ -22,7 +22,8 @@ interface CredentialInput {
   refreshToken: string
   clientId?: string
   clientSecret?: string
-  region?: string
+  authRegion?: string
+  apiRegion?: string
   priority?: number
   machineId?: string
 }
@@ -174,7 +175,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
-            region: cred.region?.trim() || undefined,
+            authRegion: cred.authRegion?.trim() || undefined,
+            apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
             clientSecret,
             priority: cred.priority || 0,
@@ -318,7 +320,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","region":"us-east-1"}]'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

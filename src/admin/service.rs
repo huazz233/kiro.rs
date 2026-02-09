@@ -197,6 +197,8 @@ impl AdminService {
             client_secret: req.client_secret,
             priority: req.priority,
             region: req.region,
+            auth_region: req.auth_region,
+            api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
         };

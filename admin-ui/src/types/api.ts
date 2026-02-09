@@ -63,7 +63,8 @@ export interface AddCredentialRequest {
   clientId?: string
   clientSecret?: string
   priority?: number
-  region?: string
+  authRegion?: string
+  apiRegion?: string
   machineId?: string
 }
 

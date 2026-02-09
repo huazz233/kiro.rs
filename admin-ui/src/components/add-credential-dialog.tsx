@@ -22,7 +22,8 @@ type AuthMethod = 'social' | 'idc'
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
-  const [region, setRegion] = useState('')
+  const [authRegion, setAuthRegion] = useState('')
+  const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [priority, setPriority] = useState('0')
@@ -33,7 +34,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const resetForm = () => {
     setRefreshToken('')
     setAuthMethod('social')
-    setRegion('')
+    setAuthRegion('')
+    setApiRegion('')
     setClientId('')
     setClientSecret('')
     setPriority('0')
@@ -59,7 +61,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         refreshToken: refreshToken.trim(),
         authMethod,
-        region: region.trim() || undefined,
+        authRegion: authRegion.trim() || undefined,
+        apiRegion: apiRegion.trim() || undefined,
         clientId: clientId.trim() || undefined,
         clientSecret: clientSecret.trim() || undefined,
         priority: parseInt(priority) || 0,
@@ -80,13 +83,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>添加凭据</DialogTitle>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit}>
-          <div className="space-y-4 py-4">
+        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
+          <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
             {/* Refresh Token */}
             <div className="space-y-2">
               <label htmlFor="refreshToken" className="text-sm font-medium">
@@ -119,17 +122,32 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </select>
             </div>
 
+            {/* Region 配置 */}
             <div className="space-y-2">
-              <label htmlFor="region" className="text-sm font-medium">
-                刷新 Token 地域
-              </label>
-              <Input
-                id="region"
-                placeholder="例如 us-east-1（留空则使用全局 region）"
-                value={region}
-                onChange={(e) => setRegion(e.target.value)}
-                disabled={isPending}
-              />
+              <label className="text-sm font-medium">Region 配置</label>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <Input
+                    id="authRegion"
+                    placeholder="Auth Region"
+                    value={authRegion}
+                    onChange={(e) => setAuthRegion(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div>
+                  <Input
+                    id="apiRegion"
+                    placeholder="API Region"
+                    value={apiRegion}
+                    onChange={(e) => setApiRegion(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+              </p>
             </div>
 
             {/* IdC/Builder-ID/IAM 额外字段 */}
