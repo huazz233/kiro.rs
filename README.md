@@ -385,6 +385,50 @@ kiro-rs/
 }
 ```
 
+### 输入压缩
+
+内置 5 层输入压缩管道，用于规避 Kiro 上游约 400KB 的请求体大小限制。压缩在协议转换完成后、发送上游前自动执行，按低风险→高风险顺序逐层处理：
+
+1. **空白压缩** — 连续 3+ 空行合并为 2 行，移除行尾空格，保留行首缩进
+2. **thinking 块处理** — `discard` 完全移除 / `truncate` 保留前 N 字符 / `keep` 保留原样
+3. **tool_result 智能截断** — 按行截断保留头尾，行数不足时回退字符级截断，插入 `[X lines omitted]` 标记
+4. **tool_use input 截断** — 递归遍历 JSON，截断超长字符串字段
+5. **历史截断** — 保留前 2 条系统消息对，从前往后成对移除，支持按轮数或字符数限制
+
+在 `config.json` 中通过 `compression` 字段配置：
+
+```json
+{
+  "compression": {
+    "enabled": true,
+    "whitespaceCompression": true,
+    "thinkingStrategy": "discard",
+    "toolResultMaxChars": 8000,
+    "toolResultHeadLines": 80,
+    "toolResultTailLines": 40,
+    "toolUseInputMaxChars": 6000,
+    "toolDescriptionMaxChars": 4000,
+    "maxHistoryTurns": 80,
+    "maxHistoryChars": 400000
+  }
+}
+```
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `true` | 压缩总开关 |
+| `whitespaceCompression` | `true` | 空白压缩开关 |
+| `thinkingStrategy` | `"discard"` | thinking 块策略：`discard` / `truncate` / `keep` |
+| `toolResultMaxChars` | `8000` | tool_result 截断阈值（字符数） |
+| `toolResultHeadLines` | `80` | 智能截断保留头部行数 |
+| `toolResultTailLines` | `40` | 智能截断保留尾部行数 |
+| `toolUseInputMaxChars` | `6000` | tool_use input 截断阈值（字符数） |
+| `toolDescriptionMaxChars` | `4000` | 工具描述截断阈值（字符数） |
+| `maxHistoryTurns` | `80` | 历史最大轮数（0 = 不限） |
+| `maxHistoryChars` | `400000` | 历史最大字符数（0 = 不限） |
+
+> 所有参数均有默认值，无需额外配置即可开箱使用。如需关闭压缩，设置 `"enabled": false` 即可。
+
 ## 认证方式
 
 支持两种 API Key 认证方式：

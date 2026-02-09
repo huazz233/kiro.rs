@@ -36,7 +36,9 @@ fn is_input_too_long_error(err: &Error) -> bool {
     //
     // 这类错误是确定性的请求问题（缩短输入才可恢复），不应返回 5xx（会诱发客户端重试）。
     let s = err.to_string();
-    s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || s.contains("Input is too long")
+    s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD")
+        || s.contains("Input is too long")
+        || s.contains("Improperly formed request")
 }
 
 fn map_kiro_provider_error_to_response(request_body: &str, err: Error) -> Response {
