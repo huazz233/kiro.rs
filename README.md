@@ -206,22 +206,22 @@ docker-compose up
 
 #### 字段说明
 
-| 字段 | 类型 | 描述 |
-|------|------|------|
-| `id` | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填） |
-| `accessToken` | string | OAuth 访问令牌（可选，可自动刷新） |
-| `refreshToken` | string | OAuth 刷新令牌 |
-| `profileArn` | string | AWS Profile ARN（可选，登录时返回） |
-| `expiresAt` | string | Token 过期时间 (RFC3339) |
-| `authMethod` | string | 认证方式：`social` 或 `idc` |
-| `clientId` | string | IdC 登录的客户端 ID（IdC 认证必填） |
-| `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填） |
-| `priority` | number | 凭据优先级，数字越小越优先，默认为 0 |
-| `region` | string | 凭据级 region，用于 OIDC token 刷新时指定 endpoint 区域 |
-| `authRegion` | string | 凭据级 Auth Region，用于 Token 刷新 |
-| `apiRegion` | string | 凭据级 API Region，用于 API 请求 |
-| `machineId` | string | 凭据级机器码（64位十六进制） |
-| `email` | string | 用户邮箱（可选，从 API 获取） |
+| 字段             | 类型     | 描述                                          |
+|----------------|--------|---------------------------------------------|
+| `id`           | number | 凭据唯一 ID（可选，仅用于 Admin API 管理；手写文件可不填）        |
+| `accessToken`  | string | OAuth 访问令牌（可选，可自动刷新）                        |
+| `refreshToken` | string | OAuth 刷新令牌                                  |
+| `profileArn`   | string | AWS Profile ARN（可选，登录时返回）                   |
+| `expiresAt`    | string | Token 过期时间 (RFC3339)                        |
+| `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
+| `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
+| `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
+| `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
+| `region`       | string | 凭据级 Auth Region, 兼容字段                       |
+| `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
+| `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
+| `machineId`    | string | 凭据级机器码（64位十六进制）                             |
+| `email`        | string | 用户邮箱（可选，从 API 获取）                           |
 
 说明：
 - IdC / Builder-ID / IAM 在本项目里属于同一种登录方式，配置时统一使用 `authMethod: "idc"`
