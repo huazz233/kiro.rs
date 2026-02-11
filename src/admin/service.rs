@@ -203,6 +203,7 @@ impl AdminService {
             api_region: req.api_region,
             machine_id: req.machine_id,
             email: req.email,
+            subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
@@ -214,6 +215,11 @@ impl AdminService {
             .add_credential(new_cred)
             .await
             .map_err(|e| self.classify_add_error(e))?;
+
+        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
+        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        }
 
         Ok(AddCredentialResponse {
             success: true,
