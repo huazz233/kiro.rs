@@ -49,6 +49,15 @@ pub struct Model {
     #[serde(rename = "type")]
     pub model_type: String,
     pub max_tokens: i32,
+    /// 上下文窗口大小（tokens）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<i64>,
+    /// 最大补全 tokens
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<i64>,
+    /// 是否支持 thinking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<bool>,
 }
 
 /// 模型列表响应
@@ -60,8 +69,8 @@ pub struct ModelsResponse {
 
 // === Messages 端点类型 ===
 
-/// 最大思考预算 tokens
-const MAX_BUDGET_TOKENS: i32 = 24576;
+/// 最大思考预算 tokens（Kiro 后端上限 32K）
+const MAX_BUDGET_TOKENS: i32 = 32_000;
 
 /// Thinking 配置
 #[derive(Debug, Deserialize, Clone)]
@@ -290,4 +299,11 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
+}
+
+/// 根据模型名获取上下文窗口大小
+///
+/// Kiro 后端所有模型统一 200K 上下文窗口
+pub(crate) fn get_context_window_size(_model: &str) -> i32 {
+    200_000
 }

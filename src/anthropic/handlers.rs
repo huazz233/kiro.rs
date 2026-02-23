@@ -24,7 +24,8 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::truncation;
+use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking, get_context_window_size};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -67,104 +68,53 @@ fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
+/// 构建模型定义的辅助函数
+fn build_model(id: &str, created: i64, display_name: &str) -> Model {
+    Model {
+        id: id.to_string(),
+        object: "model".to_string(),
+        created,
+        owned_by: "anthropic".to_string(),
+        display_name: display_name.to_string(),
+        model_type: "chat".to_string(),
+        max_tokens: 32000,
+        context_length: Some(200_000),
+        max_completion_tokens: Some(64_000),
+        thinking: Some(true),
+    }
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
 pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1727568000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1727568000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1730419200,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770314400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1727740800,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1727740800,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 32000,
-        },
+    // (id, created, display_name)
+    let model_defs: &[(&str, i64, &str)] = &[
+        // Base models
+        ("claude-sonnet-4-5-20250929", 1727568000, "Claude Sonnet 4.5"),
+        ("claude-sonnet-4-5-20250929-thinking", 1727568000, "Claude Sonnet 4.5 (Thinking)"),
+        ("claude-opus-4-5-20251101", 1730419200, "Claude Opus 4.5"),
+        ("claude-opus-4-5-20251101-thinking", 1730419200, "Claude Opus 4.5 (Thinking)"),
+        ("claude-sonnet-4-6", 1770314400, "Claude Sonnet 4.6"),
+        ("claude-sonnet-4-6-thinking", 1770314400, "Claude Sonnet 4.6 (Thinking)"),
+        ("claude-opus-4-6", 1770314400, "Claude Opus 4.6"),
+        ("claude-opus-4-6-thinking", 1770314400, "Claude Opus 4.6 (Thinking)"),
+        ("claude-haiku-4-5-20251001", 1727740800, "Claude Haiku 4.5"),
+        ("claude-haiku-4-5-20251001-thinking", 1727740800, "Claude Haiku 4.5 (Thinking)"),
+        // Agentic 变体 — 带有专用分块写入系统提示
+        ("claude-sonnet-4-5-20250929-agentic", 1727568000, "Claude Sonnet 4.5 (Agentic)"),
+        ("claude-opus-4-5-20251101-agentic", 1730419200, "Claude Opus 4.5 (Agentic)"),
+        ("claude-opus-4-6-agentic", 1770314400, "Claude Opus 4.6 (Agentic)"),
+        ("claude-sonnet-4-6-agentic", 1770314400, "Claude Sonnet 4.6 (Agentic)"),
+        ("claude-haiku-4-5-20251001-agentic", 1727740800, "Claude Haiku 4.5 (Agentic)"),
     ];
+
+    let models: Vec<Model> = model_defs
+        .iter()
+        .map(|(id, created, display_name)| build_model(id, *created, display_name))
+        .collect();
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -428,9 +378,6 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 上下文窗口大小（200k tokens）
-const CONTEXT_WINDOW_SIZE: i32 = 200_000;
-
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -499,14 +446,35 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
+                                    let parse_result: Result<serde_json::Value, _> =
+                                        serde_json::from_str(buffer);
+
+                                    match parse_result {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            // 检测是否为截断
+                                            let truncation_info = truncation::detect_truncation(
+                                                &tool_use.name,
+                                                &tool_use.tool_use_id,
+                                                buffer,
+                                                None,
                                             );
+                                            if truncation_info.is_truncated {
+                                                tracing::warn!(
+                                                    "工具输入被截断: tool={}, id={}, type={:?}",
+                                                    tool_use.name,
+                                                    tool_use.tool_use_id,
+                                                    truncation_info.truncation_type
+                                                );
+                                            } else {
+                                                tracing::warn!(
+                                                    "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                                    e, tool_use.tool_use_id
+                                                );
+                                            }
                                             serde_json::json!({})
-                                        })
+                                        }
+                                    }
                                 };
 
                                 tool_uses.push(json!({
@@ -519,9 +487,9 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            // 公式: percentage * 200000 / 100 = percentage * 2000
+                            let context_window = get_context_window_size(model);
                             let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (CONTEXT_WINDOW_SIZE as f64)
+                                * (context_window as f64)
                                 / 100.0)
                                 as i32;
                             context_input_tokens = Some(actual_input_tokens);
@@ -530,9 +498,10 @@ async fn handle_non_stream_request(
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {} (context_window: {})",
                                 context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                actual_input_tokens,
+                                context_window
                             );
                         }
                         Event::Exception { exception_type, .. } => {
@@ -595,7 +564,15 @@ async fn handle_non_stream_request(
 ///
 /// - Opus 4.6：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// - budget_tokens 默认为 20000
+///
+/// 同时支持 thinking level 后缀：
+/// - `-thinking-minimal` → budget 512
+/// - `-thinking-low` → budget 1024
+/// - `-thinking-medium` → budget 8192
+/// - `-thinking-high` → budget 24576
+/// - `-thinking-xhigh` → budget 32768
+/// - `-thinking` → budget 20000（默认）
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
@@ -611,15 +588,32 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         "enabled"
     };
 
+    // 从模型名后缀解析 thinking level → budget
+    let budget_tokens = if model_lower.ends_with("-thinking-minimal") {
+        512
+    } else if model_lower.ends_with("-thinking-low") {
+        1024
+    } else if model_lower.ends_with("-thinking-medium") {
+        8192
+    } else if model_lower.ends_with("-thinking-high") {
+        24576
+    } else if model_lower.ends_with("-thinking-xhigh") {
+        32768
+    } else {
+        // 默认 budget
+        20000
+    };
+
     tracing::info!(
         model = %payload.model,
         thinking_type = thinking_type,
+        budget_tokens = budget_tokens,
         "模型名包含 thinking 后缀，覆写 thinking 配置"
     );
 
     payload.thinking = Some(Thinking {
         thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
+        budget_tokens,
     });
     
     if is_opus_4_6 {
