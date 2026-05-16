@@ -9,6 +9,8 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use tracing::Instrument;
+use uuid::Uuid;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
@@ -75,4 +77,14 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+/// 请求 ID 中间件
+///
+/// 为每个请求生成 8 字符 hex 的唯一 ID，并注入 tracing span，
+/// 使后续所有日志自动携带 `req_id` 字段。
+pub async fn request_id_middleware(request: Request<Body>, next: Next) -> Response {
+    let req_id = &Uuid::new_v4().to_string()[..8];
+    let span = tracing::info_span!("request", req_id = %req_id);
+    next.run(request).instrument(span).await
 }

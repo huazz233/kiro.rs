@@ -11,7 +11,7 @@ use crate::kiro::provider::KiroProvider;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, auth_middleware, cors_layer, request_id_middleware},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -52,7 +52,8 @@ pub fn create_router_with_provider(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ));
+        ))
+        .layer(middleware::from_fn(request_id_middleware));
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
@@ -62,7 +63,8 @@ pub fn create_router_with_provider(
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ));
+        ))
+        .layer(middleware::from_fn(request_id_middleware));
 
     Router::new()
         .nest("/v1", v1_routes)
