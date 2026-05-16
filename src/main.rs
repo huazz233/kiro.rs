@@ -141,6 +141,8 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    // 启动后台凭据回写 loop：每 1s 检查 dirty flag，避免高频 IO
+    token_manager.start_save_loop();
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -195,6 +197,10 @@ async fn main() {
         anthropic_app
     };
 
+    // 匿名健康检查路由（不走 auth_middleware）
+    let health_app = anthropic::create_health_router(token_manager.clone());
+    let app = app.merge(health_app);
+
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
@@ -203,6 +209,9 @@ async fn main() {
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
+    tracing::info!("Health (anonymous):");
+    tracing::info!("  GET  /health");
+    tracing::info!("  GET  /provider_health");
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
