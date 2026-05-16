@@ -131,3 +131,39 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/kiro-rs
             target/${{ matrix.target }}/release/kiro-rs.exe
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename binaries with OS-arch suffix
+        shell: bash
+        run: |
+          mkdir -p release-files
+          cd artifacts
+          for dir in kiro-rs-*; do
+            # dir 形如 kiro-rs-v2026.4.1-Linux-x64，截取第 4 段起作为 OS-arch 后缀
+            suffix=$(echo "$dir" | cut -d'-' -f4-)
+            if [ -f "$dir/kiro-rs.exe" ]; then
+              cp "$dir/kiro-rs.exe" "../release-files/kiro-rs-${suffix}.exe"
+            elif [ -f "$dir/kiro-rs" ]; then
+              cp "$dir/kiro-rs" "../release-files/kiro-rs-${suffix}"
+            fi
+          done
+          ls -la ../release-files/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
