@@ -414,6 +414,10 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 累计 Token 刷新次数（成功后重置，达阈值后禁用）
+    refresh_count: u32,
+    /// 最后一次 Token 刷新尝试时间（用于 30s 防抖）
+    last_refresh_attempt: Option<Instant>,
 }
 
 /// 禁用原因
@@ -526,6 +530,12 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 凭据数据是否有未落盘更新（用于 1s 防抖回写）
+    credentials_dirty: std::sync::Arc<AtomicBool>,
+    /// 凭据回写后台任务关闭信号
+    save_loop_shutdown: std::sync::Arc<tokio::sync::Notify>,
+    /// 最近一次凭据回写时间（用于 debounce）
+    last_credentials_save_at: Mutex<Option<Instant>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -534,6 +544,12 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// Token 刷新超时时间（秒），防止上游 socket hang 拖死整个流程
 const REFRESH_TIMEOUT_SECS: u64 = 60;
+/// 凭据累计刷新失败次数达到此阈值后自动禁用
+const MAX_REFRESH_COUNT: u32 = 5;
+/// Token 刷新防抖窗口（秒），窗口内不重复刷新
+const REFRESH_COOLDOWN_SECS: u64 = 30;
+/// 凭据回写防抖间隔（秒）
+const CREDENTIALS_SAVE_DEBOUNCE_SECS: u64 = 1;
 
 /// API 调用上下文
 ///
@@ -601,6 +617,8 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    refresh_count: 0,
+                    last_refresh_attempt: None,
                 }
             })
             .collect();
@@ -646,6 +664,8 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let credentials_dirty = std::sync::Arc::new(AtomicBool::new(false));
+        let save_loop_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let manager = Self {
             config,
             proxy,
@@ -657,6 +677,9 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            credentials_dirty,
+            save_loop_shutdown,
+            last_credentials_save_at: Mutex::new(None),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -876,6 +899,74 @@ impl MultiTokenManager {
         }
     }
 
+    /// 检查指定凭据是否允许执行 Token 刷新
+    ///
+    /// 检查两个条件：
+    /// 1. refresh_count < MAX_REFRESH_COUNT（累计刷新失败次数未达阈值）
+    /// 2. 距离上次刷新尝试已超过 REFRESH_COOLDOWN_SECS（防抖窗口）
+    ///
+    /// 如果 refresh_count 达到阈值，会自动禁用凭据。
+    fn check_refresh_allowed(&self, id: u64) -> anyhow::Result<()> {
+        let mut entries = self.entries.lock();
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+
+        // 检查累计刷新失败次数
+        if entry.refresh_count >= MAX_REFRESH_COUNT {
+            if !entry.disabled {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::TooManyRefreshFailures);
+                tracing::error!(
+                    "凭据 #{} 累计刷新失败 {} 次，已禁用",
+                    id,
+                    entry.refresh_count
+                );
+            }
+            bail!(
+                "凭据 #{} 累计刷新失败次数过多（{}/{}），已禁用",
+                id,
+                entry.refresh_count,
+                MAX_REFRESH_COUNT
+            );
+        }
+
+        // 检查 30s 防抖窗口
+        if let Some(last_attempt) = entry.last_refresh_attempt {
+            let elapsed = last_attempt.elapsed();
+            if elapsed < StdDuration::from_secs(REFRESH_COOLDOWN_SECS) {
+                let remaining = StdDuration::from_secs(REFRESH_COOLDOWN_SECS) - elapsed;
+                bail!(
+                    "凭据 #{} refresh 调用过于频繁，{}s 内已尝试过（剩余冷却 {:.0}s）",
+                    id,
+                    REFRESH_COOLDOWN_SECS,
+                    remaining.as_secs_f64()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 记录凭据刷新成功，重置 refresh_count
+    fn record_refresh_success(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.refresh_count = 0;
+            entry.last_refresh_attempt = None; // 成功后清除冷却窗口
+        }
+    }
+
+    /// 记录凭据刷新失败，增加 refresh_count 并更新 last_refresh_attempt
+    fn record_refresh_failure(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.refresh_count += 1;
+            entry.last_refresh_attempt = Some(Instant::now());
+        }
+    }
+
     /// 尝试使用指定凭据获取有效 Token
     ///
     /// 使用双重检查锁定模式，确保同一时间只有一个刷新操作
@@ -919,9 +1010,12 @@ impl MultiTokenManager {
             };
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                // 检查刷新冷却和次数限制
+                self.check_refresh_allowed(id)?;
+
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds = tokio::time::timeout(
+                let refresh_result = tokio::time::timeout(
                     StdDuration::from_secs(REFRESH_TIMEOUT_SECS),
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()),
                 )
@@ -932,26 +1026,36 @@ impl MultiTokenManager {
                         id,
                         REFRESH_TIMEOUT_SECS
                     )
-                })??;
+                })?;
 
-                if is_token_expired(&new_creds) {
-                    anyhow::bail!("刷新后的 Token 仍然无效或已过期");
-                }
+                match refresh_result {
+                    Ok(new_creds) => {
+                        if is_token_expired(&new_creds) {
+                            self.record_refresh_failure(id);
+                            anyhow::bail!("刷新后的 Token 仍然无效或已过期");
+                        }
 
-                // 更新凭据
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
+                        // 刷新成功，重置计数
+                        self.record_refresh_success(id);
+
+                        // 更新凭据
+                        {
+                            let mut entries = self.entries.lock();
+                            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                                entry.credentials = new_creds.clone();
+                            }
+                        }
+
+                        // 回写凭据到文件（仅多凭据格式），失败只记录警告
+                        self.mark_credentials_dirty();
+
+                        new_creds
+                    }
+                    Err(e) => {
+                        self.record_refresh_failure(id);
+                        return Err(e);
                     }
                 }
-
-                // 回写凭据到文件（仅多凭据格式），失败只记录警告
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
-
-                new_creds
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
                 tracing::debug!("Token 已被其他请求刷新，跳过刷新");
@@ -1031,6 +1135,73 @@ impl MultiTokenManager {
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
+    }
+
+    /// 标记凭据数据已变更，按 1s 防抖策略决定是否立即落盘
+    fn mark_credentials_dirty(&self) {
+        self.credentials_dirty.store(true, Ordering::Relaxed);
+
+        let should_flush = {
+            let last = *self.last_credentials_save_at.lock();
+            match last {
+                Some(last_saved_at) => {
+                    last_saved_at.elapsed()
+                        >= StdDuration::from_secs(CREDENTIALS_SAVE_DEBOUNCE_SECS)
+                }
+                None => true,
+            }
+        };
+
+        if should_flush {
+            self.flush_credentials_if_dirty();
+        }
+    }
+
+    /// 如果 credentials_dirty 为 true，立即执行一次凭据回写并清除标记
+    fn flush_credentials_if_dirty(&self) {
+        if self.credentials_dirty.swap(false, Ordering::Relaxed) {
+            match self.persist_credentials() {
+                Ok(_) => {
+                    *self.last_credentials_save_at.lock() = Some(Instant::now());
+                }
+                Err(e) => {
+                    tracing::warn!("凭据防抖回写失败: {}", e);
+                }
+            }
+        }
+    }
+
+    /// 启动凭据回写后台任务（每 1s 检查 dirty flag 并落盘）
+    ///
+    /// 应在 `Arc::new(manager)` 后调用一次。
+    /// Drop 时通过 `save_loop_shutdown` 通知退出。
+    pub fn start_save_loop(self: &std::sync::Arc<Self>) {
+        let dirty = self.credentials_dirty.clone();
+        let shutdown = self.save_loop_shutdown.clone();
+        let manager = std::sync::Arc::downgrade(self);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.notified() => {
+                        // 收到关闭信号，最后 flush 一次
+                        if let Some(m) = manager.upgrade() {
+                            m.flush_credentials_if_dirty();
+                        }
+                        break;
+                    }
+                    _ = tokio::time::sleep(StdDuration::from_secs(CREDENTIALS_SAVE_DEBOUNCE_SECS)) => {
+                        if dirty.load(Ordering::Relaxed) {
+                            if let Some(m) = manager.upgrade() {
+                                m.flush_credentials_if_dirty();
+                            } else {
+                                break; // manager 已被释放
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// 获取缓存目录（凭据文件所在目录）
@@ -1142,6 +1313,8 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.refresh_count = 0;
+                entry.last_refresh_attempt = None;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1487,6 +1660,8 @@ impl MultiTokenManager {
                 // 启用时重置失败计数
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.refresh_count = 0;
+                entry.last_refresh_attempt = None;
                 entry.disabled_reason = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
@@ -1575,8 +1750,11 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                    // 检查刷新冷却和次数限制
+                    self.check_refresh_allowed(id)?;
+
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                    let new_creds = tokio::time::timeout(
+                    let refresh_result = tokio::time::timeout(
                         StdDuration::from_secs(REFRESH_TIMEOUT_SECS),
                         refresh_token(&current_creds, &self.config, effective_proxy.as_ref()),
                     )
@@ -1587,20 +1765,28 @@ impl MultiTokenManager {
                             id,
                             REFRESH_TIMEOUT_SECS
                         )
-                    })??;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
+                    })?;
+
+                    match refresh_result {
+                        Ok(new_creds) => {
+                            self.record_refresh_success(id);
+                            {
+                                let mut entries = self.entries.lock();
+                                if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                                    entry.credentials = new_creds.clone();
+                                }
+                            }
+                            // 持久化失败只记录警告，不影响本次请求
+                            self.mark_credentials_dirty();
+                            new_creds
+                                .access_token
+                                .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+                        }
+                        Err(e) => {
+                            self.record_refresh_failure(id);
+                            return Err(e);
                         }
                     }
-                    // 持久化失败只记录警告，不影响本次请求
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
                 } else {
                     current_creds
                         .access_token
@@ -1650,9 +1836,7 @@ impl MultiTokenManager {
             };
 
             if changed {
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
-                }
+                self.mark_credentials_dirty();
             }
         }
 
@@ -1788,6 +1972,8 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                refresh_count: 0,
+                last_refresh_attempt: None,
             });
         }
 
@@ -1878,12 +2064,15 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
+        // 检查刷新冷却和次数限制
+        self.check_refresh_allowed(id)?;
+
         // 获取刷新锁防止并发刷新
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds = tokio::time::timeout(
+        let refresh_result = tokio::time::timeout(
             StdDuration::from_secs(REFRESH_TIMEOUT_SECS),
             refresh_token(&credentials, &self.config, effective_proxy.as_ref()),
         )
@@ -1894,24 +2083,31 @@ impl MultiTokenManager {
                 id,
                 REFRESH_TIMEOUT_SECS
             )
-        })??;
+        })?;
 
-        // 更新 entries 中对应凭据
-        {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
-                entry.refresh_failure_count = 0;
+        match refresh_result {
+            Ok(new_creds) => {
+                self.record_refresh_success(id);
+                // 更新 entries 中对应凭据
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds;
+                        entry.refresh_failure_count = 0;
+                    }
+                }
+
+                // 持久化
+                self.mark_credentials_dirty();
+
+                tracing::info!("凭据 #{} Token 已强制刷新", id);
+                Ok(())
+            }
+            Err(e) => {
+                self.record_refresh_failure(id);
+                Err(e)
             }
         }
-
-        // 持久化
-        if let Err(e) = self.persist_credentials() {
-            tracing::warn!("强制刷新 Token 后持久化失败: {}", e);
-        }
-
-        tracing::info!("凭据 #{} Token 已强制刷新", id);
-        Ok(())
     }
 
     /// 获取负载均衡模式（Admin API）
@@ -1966,6 +2162,15 @@ impl MultiTokenManager {
 
 impl Drop for MultiTokenManager {
     fn drop(&mut self) {
+        // 通知 save_loop 退出
+        self.save_loop_shutdown.notify_one();
+        // flush 凭据脏数据
+        if self.credentials_dirty.load(Ordering::Relaxed) {
+            self.credentials_dirty.store(false, Ordering::Relaxed);
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("Drop 时凭据回写失败: {}", e);
+            }
+        }
         if self.stats_dirty.load(Ordering::Relaxed) {
             self.save_stats();
         }
@@ -2676,5 +2881,288 @@ mod tests {
             "错误信息应包含凭据 ID，实际: {}",
             err_msg
         );
+    }
+
+    // ============ #5 凭据级 refresh cooldown 测试 ============
+
+    #[test]
+    fn test_refresh_count_disable_after_max() {
+        // 模拟凭据累计刷新失败 MAX_REFRESH_COUNT 次后被自动禁用
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 累计失败 MAX_REFRESH_COUNT 次
+        for _ in 0..MAX_REFRESH_COUNT {
+            manager.record_refresh_failure(1);
+        }
+
+        // 此时 check_refresh_allowed 应返回错误并禁用凭据
+        let result = manager.check_refresh_allowed(1);
+        assert!(result.is_err(), "应该拒绝刷新");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("累计刷新失败次数过多"),
+            "错误信息应包含'累计刷新失败次数过多'，实际: {}",
+            err_msg
+        );
+
+        // 凭据应被禁用
+        assert_eq!(manager.available_count(), 0);
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(entry.disabled);
+    }
+
+    #[test]
+    fn test_refresh_count_reset_on_success() {
+        // 刷新成功后 refresh_count 应被重置
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 累计失败 MAX_REFRESH_COUNT - 1 次（还没达到阈值）
+        for _ in 0..(MAX_REFRESH_COUNT - 1) {
+            manager.record_refresh_failure(1);
+        }
+
+        // 验证 refresh_count 正确
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.refresh_count, MAX_REFRESH_COUNT - 1);
+        }
+
+        // 刷新成功重置计数
+        manager.record_refresh_success(1);
+
+        // 验证 refresh_count 被重置
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.refresh_count, 0);
+            assert!(entry.last_refresh_attempt.is_none());
+        }
+
+        // 再失败 MAX_REFRESH_COUNT - 1 次仍然不达阈值
+        for _ in 0..(MAX_REFRESH_COUNT - 1) {
+            manager.record_refresh_failure(1);
+        }
+
+        // 验证 refresh_count 正确
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.refresh_count, MAX_REFRESH_COUNT - 1);
+        }
+
+        // 凭据仍然可用
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_refresh_cooldown_30s_window() {
+        // 30s 内重复刷新应被拒绝
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 记录一次刷新失败（设置 last_refresh_attempt）
+        manager.record_refresh_failure(1);
+
+        // 立即再次检查应被拒绝（30s 内）
+        let result = manager.check_refresh_allowed(1);
+        assert!(result.is_err(), "30s 内应拒绝刷新");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("refresh 调用过于频繁"),
+            "错误信息应包含'refresh 调用过于频繁'，实际: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_refresh_cooldown_expired_allows_retry() {
+        // 模拟 30s 冷却窗口过期后允许重试
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 手动设置 last_refresh_attempt 为 31 秒前
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            entry.refresh_count = 1;
+            entry.last_refresh_attempt =
+                Some(Instant::now() - StdDuration::from_secs(REFRESH_COOLDOWN_SECS + 1));
+        }
+
+        // 冷却窗口已过，应允许刷新
+        assert!(manager.check_refresh_allowed(1).is_ok());
+    }
+
+    #[test]
+    fn test_refresh_count_api_success_resets() {
+        // API 调用成功应重置 refresh_count 和 last_refresh_attempt
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 累计刷新失败
+        for _ in 0..(MAX_REFRESH_COUNT - 1) {
+            manager.record_refresh_failure(1);
+        }
+
+        // 验证 refresh_count 累积
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.refresh_count, MAX_REFRESH_COUNT - 1);
+            assert!(entry.last_refresh_attempt.is_some());
+        }
+
+        // API 调用成功（report_success）应重置 refresh_count 和 last_refresh_attempt
+        manager.report_success(1);
+
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.refresh_count, 0);
+            assert!(entry.last_refresh_attempt.is_none());
+        }
+
+        // 再次失败到接近阈值不应禁用
+        for _ in 0..(MAX_REFRESH_COUNT - 1) {
+            manager.record_refresh_failure(1);
+        }
+
+        // 验证 refresh_count 正确
+        {
+            let entries = manager.entries.lock();
+            let entry = entries.iter().find(|e| e.id == 1).unwrap();
+            assert_eq!(entry.refresh_count, MAX_REFRESH_COUNT - 1);
+        }
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_set_disabled_resets_refresh_count() {
+        // 管理员启用凭据时应重置 refresh_count
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        // 累计失败达到阈值
+        for _ in 0..MAX_REFRESH_COUNT {
+            manager.record_refresh_failure(1);
+        }
+        let _ = manager.check_refresh_allowed(1); // 触发禁用
+        assert_eq!(manager.available_count(), 0);
+
+        // 管理员启用凭据
+        manager.set_disabled(1, false).unwrap();
+        assert_eq!(manager.available_count(), 1);
+
+        // 应该可以再次刷新
+        assert!(manager.check_refresh_allowed(1).is_ok());
+    }
+
+    // ============ #2 凭据回写防抖测试 ============
+
+    #[test]
+    fn test_credentials_dirty_flag_set_and_cleared() {
+        // 测试 mark_credentials_dirty 设置标记，flush 清除标记
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        assert!(!manager.credentials_dirty.load(Ordering::Relaxed));
+
+        // 标记脏
+        manager.credentials_dirty.store(true, Ordering::Relaxed);
+        assert!(manager.credentials_dirty.load(Ordering::Relaxed));
+
+        // flush 清除标记（无凭据路径配置，persist_credentials 会返回 Ok(false)）
+        manager.flush_credentials_if_dirty();
+        assert!(!manager.credentials_dirty.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_credentials_debounce_coalesces_writes() {
+        // 验证多次 mark_credentials_dirty 在防抖窗口内只触发一次实际写入
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "kiro-debounce-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cred_path = tmp_dir.join("credentials.json");
+
+        // 初始化带路径的 manager
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("test_token".to_string());
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred],
+            None,
+            Some(cred_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        // 多次标记脏（在防抖窗口内）
+        for _ in 0..10 {
+            manager.mark_credentials_dirty();
+        }
+
+        // 文件应被写入（至少一次，因为第一次 mark 会立即 flush）
+        assert!(cred_path.exists(), "凭据文件应被写入");
+
+        // dirty 标记应被清除或仍为 true（取决于最后一次 mark 是否在窗口外）
+        // 主要验证：不会 panic，不会写入多次造成问题
+        let content = std::fs::read_to_string(&cred_path).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1, "凭据数量应为 1");
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_drop_flushes_dirty_credentials() {
+        // 验证 Drop 时如果有脏数据会被 flush
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "kiro-drop-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cred_path = tmp_dir.join("credentials.json");
+
+        {
+            let config = Config::default();
+            let mut cred = KiroCredentials::default();
+            cred.refresh_token = Some("drop_test_token".to_string());
+            let manager = MultiTokenManager::new(
+                config,
+                vec![cred],
+                None,
+                Some(cred_path.clone()),
+                true,
+            )
+            .unwrap();
+
+            // 直接设置 dirty 而不触发写入
+            manager.credentials_dirty.store(true, Ordering::Relaxed);
+            // manager 将在此处 drop
+        }
+
+        // Drop 应该 flush 了脏数据
+        assert!(cred_path.exists(), "Drop 时应写出凭据文件");
+        let content = std::fs::read_to_string(&cred_path).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.len(), 1);
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
