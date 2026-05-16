@@ -2,7 +2,7 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -329,13 +329,23 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
-    if !validated_tool_results.is_empty() {
+    let has_tool_results = !validated_tool_results.is_empty();
+    if has_tool_results {
         context = context.with_tool_results(validated_tool_results);
     }
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    // #18: Kiro API 要求 content 非空；纯 tool_result 无文本时用约定占位符
+    let content = if text_content.is_empty() {
+        if has_tool_results {
+            "Tool results provided.".to_string()
+        } else {
+            "Continue".to_string()
+        }
+    } else {
+        text_content
+    };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -581,6 +591,9 @@ fn remove_orphaned_tool_uses(
     }
 }
 
+/// 保留最近 N 条消息中的图片原始数据，更早的消息图片替换为占位符文本
+const KEEP_IMAGE_RECENT_COUNT: usize = 5;
+
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
 
@@ -743,7 +756,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     let history_end_index = messages.len().saturating_sub(1);
 
     // 收集并配对消息
-    let mut user_buffer: Vec<&super::types::Message> = Vec::new();
+    let mut user_buffer: Vec<(usize, &super::types::Message)> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
 
     for i in 0..history_end_index {
@@ -756,11 +769,16 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
-            user_buffer.push(msg);
+            user_buffer.push((i, msg));
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                // #16: 计算 distance_from_end，决定是否保留图片
+                let first_idx = user_buffer[0].0;
+                let distance_from_end = (messages.len() - 1) - first_idx;
+                let should_keep_images = distance_from_end <= KEEP_IMAGE_RECENT_COUNT;
+                let msgs: Vec<_> = user_buffer.iter().map(|(_, m)| *m).collect();
+                let merged_user = merge_user_messages(&msgs, model_id, should_keep_images)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -777,7 +795,11 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let first_idx = user_buffer[0].0;
+        let distance_from_end = (messages.len() - 1) - first_idx;
+        let should_keep_images = distance_from_end <= KEEP_IMAGE_RECENT_COUNT;
+        let msgs: Vec<_> = user_buffer.iter().map(|(_, m)| *m).collect();
+        let merged_user = merge_user_messages(&msgs, model_id, should_keep_images)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -785,26 +807,68 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         history.push(Message::Assistant(auto_assistant));
     }
 
+    // #17: 确保 history 以 assistantResponseMessage 结尾（Kiro API 硬约束）
+    // 注意：上面的逻辑已保证孤立 user buffer 会自动配对 assistant，
+    // 但额外检查以防万一（如 system-only 情况）
+    if !history.is_empty() {
+        if !matches!(history.last(), Some(Message::Assistant(_))) {
+            tracing::info!("history 末尾不是 assistant，补充 Continue");
+            history.push(Message::Assistant(HistoryAssistantMessage::new("Continue")));
+        }
+    }
+
     Ok(history)
 }
 
 /// 合并多个 user 消息
+///
+/// # Arguments
+/// * `messages` - 待合并的 user 消息列表
+/// * `model_id` - 模型 ID
+/// * `should_keep_images` - 是否保留图片原始数据（false 时替换为占位符文本）
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    should_keep_images: bool,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
+    let mut replaced_image_count: usize = 0;
 
     for msg in messages {
         let (text, images, tool_results) = process_message_content(&msg.content)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
-        all_images.extend(images);
+        // #16: 超阈值的消息图片替换为占位符
+        if should_keep_images {
+            all_images.extend(images);
+        } else {
+            replaced_image_count += images.len();
+        }
         all_tool_results.extend(tool_results);
     }
+
+    // #16: 被替换的图片添加占位符说明
+    if replaced_image_count > 0 {
+        let placeholder = format!(
+            "[此消息包含 {} 张图片，已在历史记录中省略]",
+            replaced_image_count
+        );
+        content_parts.push(placeholder);
+        tracing::info!(
+            "将 {} 张历史图片替换为占位符",
+            replaced_image_count
+        );
+    }
+
+    // #14: tool_result 按 toolUseId 去重，保留首次出现的
+    let mut seen_tool_use_ids = HashSet::new();
+    let deduped_tool_results: Vec<_> = all_tool_results
+        .into_iter()
+        .filter(|tr| seen_tool_use_ids.insert(tr.tool_use_id.clone()))
+        .collect();
 
     let content = content_parts.join("\n");
     // 保留文本内容，即使有工具结果也不丢弃用户文本
@@ -814,9 +878,9 @@ fn merge_user_messages(
         user_msg = user_msg.with_images(all_images);
     }
 
-    if !all_tool_results.is_empty() {
+    if !deduped_tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
-        ctx = ctx.with_tool_results(all_tool_results);
+        ctx = ctx.with_tool_results(deduped_tool_results);
         user_msg = user_msg.with_context(ctx);
     }
 
@@ -854,7 +918,11 @@ fn convert_assistant_message(
                         }
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
-                                let input = block.input.unwrap_or(serde_json::json!({}));
+                                // #20: Kiro API 要求 input 是对象；None 或 Null 都兜底为 {}
+                                let input = match block.input {
+                                    None | Some(serde_json::Value::Null) => serde_json::json!({}),
+                                    Some(v) => v,
+                                };
                                 let mapped_name = map_tool_name(&name, tool_name_map);
                                 tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
@@ -941,17 +1009,17 @@ mod tests {
 
     #[test]
     fn test_map_model_sonnet() {
-        assert!(map_model("claude-sonnet-4-20250514")
+        assert!(map_model("claude-sonnet-4-5-20250929")
             .unwrap()
             .contains("sonnet"));
-        assert!(map_model("claude-3-5-sonnet-20241022")
+        assert!(map_model("claude-sonnet-4-6")
             .unwrap()
             .contains("sonnet"));
     }
 
     #[test]
     fn test_map_model_opus() {
-        assert!(map_model("claude-opus-4-20250514")
+        assert!(map_model("claude-opus-4-5-20251101")
             .unwrap()
             .contains("opus"));
     }
@@ -1000,7 +1068,7 @@ mod tests {
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![],
             stream: false,
@@ -1104,7 +1172,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1154,7 +1222,7 @@ mod tests {
         schema.insert("properties".to_string(), serde_json::json!({}));
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1217,7 +1285,7 @@ mod tests {
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1316,7 +1384,7 @@ mod tests {
 
         // 测试带有 metadata 的请求，应该使用 session UUID 作为 conversationId
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1348,7 +1416,7 @@ mod tests {
 
         // 测试没有 metadata 的请求，应该生成新的 UUID
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -1748,7 +1816,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![
                 AnthropicMessage {
@@ -1802,5 +1870,231 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    // ============ 第一批实施新增改动的 targeted 测试 ============
+
+    /// 构造带 N 张图片的 user 消息（每张占位 base64）
+    fn user_msg_with_images(image_count: usize) -> super::super::types::Message {
+        let mut content: Vec<serde_json::Value> = vec![serde_json::json!({
+            "type": "text", "text": "msg with images"
+        })];
+        for _ in 0..image_count {
+            content.push(serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo="
+                }
+            }));
+        }
+        super::super::types::Message {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(content),
+        }
+    }
+
+    fn assistant_text(text: &str) -> super::super::types::Message {
+        super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!(text),
+        }
+    }
+
+    /// 跑 convert_request 并解包，失败时给清晰错误
+    fn run_convert(messages: Vec<super::super::types::Message>) -> ConversionResult {
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        convert_request(&req).unwrap()
+    }
+
+    /// #14: tool_result 按 toolUseId 去重，保留首次出现
+    #[test]
+    fn test_14_tool_result_dedup_by_tool_use_id() {
+        use super::super::types::Message as AM;
+        // 历史里有一个 tool-1 的 tool_use；user 消息重复了两个相同 tool_use_id 的 tool_result
+        let result = run_convert(vec![
+            AM { role: "user".to_string(), content: serde_json::json!("read it") },
+            AM {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/a"}}
+                ]),
+            },
+            AM {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "first"},
+                    {"type": "tool_result", "tool_use_id": "tool-1", "content": "duplicate"}
+                ]),
+            },
+        ]);
+
+        // 当前消息的 tool_results 应只剩一个（首次）
+        let trs = &result.conversation_state.current_message.user_input_message
+            .user_input_message_context.tool_results;
+        assert_eq!(trs.len(), 1, "重复 tool_use_id 应去重，只保留首次");
+        assert_eq!(trs[0].tool_use_id, "tool-1");
+    }
+
+    /// #16: 距离末尾 ≤ 5 的消息保留图片；> 5 的消息图片替换为占位符
+    #[test]
+    fn test_16_old_images_replaced_with_placeholder() {
+        // 构造 9 对 user/assistant + 1 个末尾 user = 19 条消息
+        // index 0..=17 进 history，index 18 是 currentMessage
+        // 距离末尾：index 13..=17 的 5 条进保留窗口（distance 1..=5）
+        // index 0..=12 的更老消息图片应被替换
+        let mut msgs = Vec::new();
+        for _ in 0..9 {
+            msgs.push(user_msg_with_images(1));
+            msgs.push(assistant_text("ok"));
+        }
+        msgs.push(user_msg_with_images(1)); // last message → currentMessage
+
+        let result = run_convert(msgs);
+        let history = &result.conversation_state.history;
+
+        // history 应只含 user 消息（每条带 0 张或 1 张图片）
+        let mut total_images: usize = 0;
+        let mut placeholder_msgs: usize = 0;
+        for m in history {
+            if let Message::User(u) = m {
+                total_images += u.user_input_message.images.len();
+                if u.user_input_message.content.contains("已在历史记录中省略") {
+                    placeholder_msgs += 1;
+                }
+            }
+        }
+        // 末尾窗口内 ≤5 条消息保留图片 → 总图片 ≤ 5
+        assert!(total_images <= 5, "保留图片应 ≤ 5，实际 {}", total_images);
+        // 老消息（>5 距离）应有占位符
+        assert!(placeholder_msgs > 0, "老消息应有占位符替换");
+    }
+
+    /// #17: history 末尾必须是 assistantResponseMessage
+    #[test]
+    fn test_17_history_ends_with_assistant() {
+        use super::super::types::Message as AM;
+        // 多轮 user/assistant + 最后一条 user → history 含成对消息
+        let result = run_convert(vec![
+            AM { role: "user".to_string(), content: serde_json::json!("q1") },
+            AM { role: "assistant".to_string(), content: serde_json::json!("a1") },
+            AM { role: "user".to_string(), content: serde_json::json!("q2") }, // currentMessage
+        ]);
+        let history = &result.conversation_state.history;
+        assert!(!history.is_empty(), "history 不应为空");
+        assert!(
+            matches!(history.last(), Some(Message::Assistant(_))),
+            "history 末尾必须是 Assistant"
+        );
+    }
+
+    /// #17b: 当 history 因孤立 user 自动配对时，末尾也应是 assistant（覆盖另一条路径）
+    #[test]
+    fn test_17b_orphan_user_pairs_with_auto_assistant() {
+        use super::super::types::Message as AM;
+        // user1 → assistant1 → user2 → user3 (last/currentMessage)
+        // build_history 处理 user1,assistant1,user2 → user2 是孤立 user，触发 auto-OK 配对
+        let result = run_convert(vec![
+            AM { role: "user".to_string(), content: serde_json::json!("u1") },
+            AM { role: "assistant".to_string(), content: serde_json::json!("a1") },
+            AM { role: "user".to_string(), content: serde_json::json!("u2") },
+            AM { role: "user".to_string(), content: serde_json::json!("u3") },
+        ]);
+        let history = &result.conversation_state.history;
+        assert!(
+            matches!(history.last(), Some(Message::Assistant(_))),
+            "孤立 user 应自动配对 assistant，history 末尾必须是 Assistant"
+        );
+    }
+
+    /// #18: 纯 tool_result 无文本的 currentMessage 应兜底为 "Tool results provided."
+    #[test]
+    fn test_18_empty_content_with_tool_result_uses_placeholder() {
+        use super::super::types::Message as AM;
+        let result = run_convert(vec![
+            AM { role: "user".to_string(), content: serde_json::json!("read it") },
+            AM {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {}}
+                ]),
+            },
+            AM {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "data"}
+                ]),
+            },
+        ]);
+        assert_eq!(
+            result.conversation_state.current_message.user_input_message.content,
+            "Tool results provided.",
+            "纯 tool_result 无文本应用占位符"
+        );
+    }
+
+    /// #18b: 完全空 content 且无 tool_result → 兜底 "Continue"
+    #[test]
+    fn test_18b_completely_empty_uses_continue() {
+        use super::super::types::Message as AM;
+        let result = run_convert(vec![
+            AM { role: "user".to_string(), content: serde_json::json!("") },
+        ]);
+        assert_eq!(
+            result.conversation_state.current_message.user_input_message.content,
+            "Continue",
+            "完全空 content 应兜底 Continue"
+        );
+    }
+
+    /// #20: tool_use 的 input 为 JSON null 时应兜底为 {}
+    #[test]
+    fn test_20_tool_use_null_input_falls_back_to_empty_object() {
+        use super::super::types::Message as AM;
+        let result = run_convert(vec![
+            AM { role: "user".to_string(), content: serde_json::json!("do it") },
+            AM {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "tu-null", "name": "act", "input": null}
+                ]),
+            },
+            AM {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "tu-null", "content": "ok"}
+                ]),
+            },
+        ]);
+        // history 里找 tu-null 这个 tool_use，验证它的 input 已经被序列化为 {}（不是 null）
+        let history = &result.conversation_state.history;
+        let mut found = false;
+        for m in history {
+            if let Message::Assistant(a) = m {
+                if let Some(ref tool_uses) = a.assistant_response_message.tool_uses {
+                    for tu in tool_uses {
+                        if tu.tool_use_id == "tu-null" {
+                            let s = serde_json::to_string(&tu.input).unwrap();
+                            assert_ne!(s, "null", "Null input 必须被兜底为非 null");
+                            assert!(s == "{}" || s.starts_with("{"), "应为对象，实际: {}", s);
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(found, "应在 history 中找到 tu-null tool_use");
     }
 }
