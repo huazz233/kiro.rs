@@ -532,6 +532,8 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// Token 刷新超时时间（秒），防止上游 socket hang 拖死整个流程
+const REFRESH_TIMEOUT_SECS: u64 = 60;
 
 /// API 调用上下文
 ///
@@ -919,8 +921,18 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                let new_creds = tokio::time::timeout(
+                    StdDuration::from_secs(REFRESH_TIMEOUT_SECS),
+                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "凭据 #{} Token 刷新超时（{}s）",
+                        id,
+                        REFRESH_TIMEOUT_SECS
+                    )
+                })??;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1564,9 +1576,18 @@ impl MultiTokenManager {
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
+                    let new_creds = tokio::time::timeout(
+                        StdDuration::from_secs(REFRESH_TIMEOUT_SECS),
+                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref()),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "凭据 #{} Token 刷新超时（{}s）",
+                            id,
+                            REFRESH_TIMEOUT_SECS
+                        )
+                    })??;
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1715,7 +1736,17 @@ impl MultiTokenManager {
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            tokio::time::timeout(
+                StdDuration::from_secs(REFRESH_TIMEOUT_SECS),
+                refresh_token(&new_cred, &self.config, effective_proxy.as_ref()),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "新凭据 Token 刷新超时（{}s）",
+                    REFRESH_TIMEOUT_SECS
+                )
+            })??
         };
 
         // 4. 分配新 ID
@@ -1852,8 +1883,18 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds = tokio::time::timeout(
+            StdDuration::from_secs(REFRESH_TIMEOUT_SECS),
+            refresh_token(&credentials, &self.config, effective_proxy.as_ref()),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "凭据 #{} Token 刷新超时（{}s）",
+                id,
+                REFRESH_TIMEOUT_SECS
+            )
+        })??;
 
         // 更新 entries 中对应凭据
         {
@@ -2595,5 +2636,45 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_token_timeout() {
+        // 使用 tokio::time::pause() 快进时间，不会真正等待 60s
+        tokio::time::pause();
+
+        let forever_pending = std::future::pending::<anyhow::Result<KiroCredentials>>();
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(REFRESH_TIMEOUT_SECS),
+            forever_pending,
+        )
+        .await;
+
+        assert!(result.is_err(), "应该超时返回 Err");
+
+        // 验证超时错误可以转换为业务错误信息
+        let err = result.map_err(|_| {
+            anyhow::anyhow!(
+                "凭据 #{} Token 刷新超时（{}s）",
+                1,
+                REFRESH_TIMEOUT_SECS
+            )
+        });
+        let err_msg = format!("{}", err.unwrap_err());
+        assert!(
+            err_msg.contains("Token 刷新超时"),
+            "错误信息应包含'Token 刷新超时'，实际: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("60s"),
+            "错误信息应包含超时秒数，实际: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("#1"),
+            "错误信息应包含凭据 ID，实际: {}",
+            err_msg
+        );
     }
 }
