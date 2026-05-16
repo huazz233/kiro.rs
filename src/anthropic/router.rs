@@ -37,14 +37,11 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
-    profile_arn: Option<String>,
+    extract_thinking: bool,
 ) -> Router {
-    let mut state = AppState::new(api_key);
+    let mut state = AppState::new(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
-    }
-    if let Some(arn) = profile_arn {
-        state = state.with_profile_arn(arn);
     }
 
     // 需要认证的 /v1 路由

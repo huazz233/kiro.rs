@@ -7,9 +7,11 @@ mod kiro;
 mod model;
 pub mod token;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
+use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -51,7 +53,24 @@ async fn main() {
     let is_multiple_format = credentials_config.is_multiple();
 
     // 转换为按优先级排序的凭据列表
-    let credentials_list = credentials_config.into_sorted_credentials();
+    let mut credentials_list = credentials_config.into_sorted_credentials();
+
+    // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
+    if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
+        if kiro_api_key.is_empty() {
+            tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
+        } else {
+            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
+            let api_key_cred = KiroCredentials {
+                kiro_api_key: Some(kiro_api_key),
+                auth_method: Some("api_key".to_string()),
+                priority: 0,
+                ..Default::default()
+            };
+            credentials_list.insert(0, api_key_cred);
+        }
+    }
+
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
     // 获取第一个凭据用于日志显示
@@ -77,6 +96,38 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
+    // 构建端点注册表
+    let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+    {
+        let ide = IdeEndpoint::new();
+        endpoints.insert(ide.name().to_string(), Arc::new(ide));
+    }
+
+    // 校验默认端点存在
+    if !endpoints.contains_key(&config.default_endpoint) {
+        tracing::error!("默认端点 \"{}\" 未注册", config.default_endpoint);
+        std::process::exit(1);
+    }
+
+    // 校验所有凭据声明的端点都已注册
+    for cred in &credentials_list {
+        let name = cred
+            .endpoint
+            .as_deref()
+            .unwrap_or(&config.default_endpoint);
+        if !endpoints.contains_key(name) {
+            tracing::error!(
+                "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
+                cred.id,
+                name,
+                endpoints.keys().collect::<Vec<_>>()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
         config.clone(),
@@ -90,7 +141,12 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
-    let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
+    let kiro_provider = KiroProvider::with_proxy(
+        token_manager.clone(),
+        proxy_config.clone(),
+        endpoints,
+        config.default_endpoint.clone(),
+    );
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -101,11 +157,11 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
-    // 构建 Anthropic API 路由（从第一个凭据获取 profile_arn）
+    // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
-        first_credentials.profile_arn.clone(),
+        config.extract_thinking,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -121,7 +177,8 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service = admin::AdminService::new(token_manager.clone());
+            let admin_service =
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

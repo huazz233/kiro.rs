@@ -23,29 +23,23 @@ pub struct AppState {
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
-    /// Profile ARN（可选，用于请求）
-    pub profile_arn: Option<String>,
+    /// 是否开启非流式响应的 thinking 块提取
+    pub extract_thinking: bool,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>) -> Self {
+    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
-            profile_arn: None,
+            extract_thinking,
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
-        self
-    }
-
-    /// 设置 Profile ARN
-    pub fn with_profile_arn(mut self, arn: impl Into<String>) -> Self {
-        self.profile_arn = Some(arn.into());
         self
     }
 }

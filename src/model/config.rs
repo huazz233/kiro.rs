@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -90,6 +91,24 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 是否开启非流式响应的 thinking 块提取（默认 true）
+    ///
+    /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
+    /// 独立的 `{"type": "thinking", ...}` 内容块,与流式响应行为一致。
+    #[serde(default = "default_extract_thinking")]
+    pub extract_thinking: bool,
+
+    /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
+    #[serde(default = "default_endpoint")]
+    pub default_endpoint: String,
+
+    /// 端点特定的配置
+    ///
+    /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
+    /// 未在此表出现的端点沿用实现内置默认值。
+    #[serde(default)]
+    pub endpoints: HashMap<String, serde_json::Value>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -108,7 +127,7 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.10.0".to_string()
+    "0.11.107".to_string()
 }
 
 fn default_system_version() -> String {
@@ -117,7 +136,7 @@ fn default_system_version() -> String {
 }
 
 fn default_node_version() -> String {
-    "22.21.1".to_string()
+    "22.22.0".to_string()
 }
 
 fn default_count_tokens_auth_type() -> String {
@@ -130,6 +149,14 @@ fn default_tls_backend() -> TlsBackend {
 
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
+}
+
+fn default_extract_thinking() -> bool {
+    true
+}
+
+fn default_endpoint() -> String {
+    crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
 impl Default for Config {
@@ -154,6 +181,9 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            extract_thinking: default_extract_thinking(),
+            default_endpoint: default_endpoint(),
+            endpoints: HashMap::new(),
             config_path: None,
         }
     }

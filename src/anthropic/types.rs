@@ -122,6 +122,7 @@ pub struct Metadata {
 
 /// Messages 请求体
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
     pub max_tokens: i32,
@@ -143,8 +144,6 @@ fn deserialize_system<'de, D>(deserializer: D) -> Result<Option<Vec<SystemMessag
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
-
     // 创建一个 visitor 来处理 string 或 array
     struct SystemVisitor;
 
@@ -235,15 +234,6 @@ pub struct Tool {
     pub max_uses: Option<i32>,
 }
 
-impl Tool {
-    /// 检查是否为 WebSearch 工具
-    pub fn is_web_search(&self) -> bool {
-        self.tool_type
-            .as_ref()
-            .is_some_and(|t| t.starts_with("web_search"))
-    }
-}
-
 /// 内容块
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ContentBlock {
@@ -299,11 +289,4 @@ pub struct CountTokensRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CountTokensResponse {
     pub input_tokens: i32,
-}
-
-/// 根据模型名获取上下文窗口大小
-///
-/// Kiro 后端所有模型统一 200K 上下文窗口
-pub(crate) fn get_context_window_size(_model: &str) -> i32 {
-    200_000
 }

@@ -25,7 +25,7 @@ use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::truncation;
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking, get_context_window_size};
+use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -101,6 +101,8 @@ pub async fn get_models() -> impl IntoResponse {
         ("claude-sonnet-4-6-thinking", 1770314400, "Claude Sonnet 4.6 (Thinking)"),
         ("claude-opus-4-6", 1770314400, "Claude Opus 4.6"),
         ("claude-opus-4-6-thinking", 1770314400, "Claude Opus 4.6 (Thinking)"),
+        ("claude-opus-4-7", 1776276000, "Claude Opus 4.7"),
+        ("claude-opus-4-7-thinking", 1776276000, "Claude Opus 4.7 (Thinking)"),
         ("claude-haiku-4-5-20251001", 1727740800, "Claude Haiku 4.5"),
         ("claude-haiku-4-5-20251001-thinking", 1727740800, "Claude Haiku 4.5 (Thinking)"),
         // Agentic 变体 — 带有专用分块写入系统提示
@@ -108,6 +110,7 @@ pub async fn get_models() -> impl IntoResponse {
         ("claude-opus-4-5-20251101-agentic", 1730419200, "Claude Opus 4.5 (Agentic)"),
         ("claude-opus-4-6-agentic", 1770314400, "Claude Opus 4.6 (Agentic)"),
         ("claude-sonnet-4-6-agentic", 1770314400, "Claude Sonnet 4.6 (Agentic)"),
+        ("claude-opus-4-7-agentic", 1776276000, "Claude Opus 4.7 (Agentic)"),
         ("claude-haiku-4-5-20251001-agentic", 1727740800, "Claude Haiku 4.5 (Agentic)"),
     ];
 
@@ -191,10 +194,10 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
-        profile_arn: state.profile_arn.clone(),
+        profile_arn: None,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -229,6 +232,8 @@ pub async fn post_messages(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let tool_name_map = conversion_result.tool_name_map;
+
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -237,11 +242,13 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            tool_name_map,
         )
         .await
     } else {
-        // 非流式响应
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = state.extract_thinking && thinking_enabled;
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
     }
 }
 
@@ -252,6 +259,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -260,7 +268,7 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled);
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -378,12 +386,16 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
+use super::converter::get_context_window_size;
+
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api(request_body).await {
@@ -477,10 +489,15 @@ async fn handle_non_stream_request(
                                     }
                                 };
 
+                                let original_name = tool_name_map
+                                    .get(&tool_use.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| tool_use.name.clone());
+
                                 tool_uses.push(json!({
                                     "type": "tool_use",
                                     "id": tool_use.tool_use_id,
-                                    "name": tool_use.name,
+                                    "name": original_name,
                                     "input": input
                                 }));
                             }
@@ -527,7 +544,25 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if !text_content.is_empty() {
+    if thinking_enabled {
+        // 从完整文本中提取 thinking 块
+        let (thinking, remaining_text) =
+            super::stream::extract_thinking_from_complete_text(&text_content);
+
+        if let Some(thinking_text) = thinking {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": thinking_text
+            }));
+        }
+
+        if !remaining_text.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": remaining_text
+            }));
+        }
+    } else if !text_content.is_empty() {
         content.push(json!({
             "type": "text",
             "text": text_content
@@ -719,10 +754,10 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
-        profile_arn: state.profile_arn.clone(),
+        profile_arn: None,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -757,6 +792,8 @@ pub async fn post_messages_cc(
         .map(|t| t.is_enabled())
         .unwrap_or(false);
 
+    let tool_name_map = conversion_result.tool_name_map;
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
@@ -765,11 +802,13 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            tool_name_map,
         )
         .await
     } else {
-        // 非流式响应（复用现有逻辑，已经使用正确的 input_tokens）
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens).await
+        // 非流式响应：仅在配置开启时提取 thinking 块
+        let extract_thinking = state.extract_thinking && thinking_enabled;
+        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
     }
 }
 
@@ -783,6 +822,7 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
@@ -791,7 +831,7 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled);
+    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
