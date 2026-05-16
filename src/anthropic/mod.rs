@@ -24,6 +24,7 @@
 
 mod converter;
 mod handlers;
+mod health;
 mod middleware;
 mod router;
 mod stream;
@@ -32,4 +33,5 @@ mod truncation;
 pub mod types;
 mod websearch;
 
+pub use health::create_health_router;
 pub use router::create_router_with_provider;
